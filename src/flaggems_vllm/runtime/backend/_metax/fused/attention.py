@@ -21,17 +21,15 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.utils import libentry, tl_extra_shim
+from flaggems_vllm.utils import libentry, libtuner, tl_extra_shim
 from flaggems_vllm.utils.device_info import get_device_capability
 from flaggems_vllm.utils.random_utils import philox_backend_seed_offset
 
 logger = logging.getLogger(__name__)
 _debug = False
 
-# W8A8-INT8: Q/K/V are int8 and both tensor-core dots run on the int8
-# tensor cores with exact int32 accumulation (int8 tl.dot lowers natively
-# on MetaX). The fp32 per-128-token-block descales restore the original
-# magnitudes before softmax and output.
+# QK uses native INT8 tensor cores with INT32 accumulation. The varlen path
+# keeps probabilities in FP16 and converts INT8 V exactly to avoid requantizing P.
 
 
 @triton.jit
@@ -277,8 +275,34 @@ def _int8_pv_dot(
     precise_p: tl.constexpr = False,
     transpose_pv: tl.constexpr = False,
     local_prob: tl.constexpr = runtime.device.vendor_name == "metax",
+    half_pv: tl.constexpr = False,
+    fold_v_descale: tl.constexpr = False,
 ):
-    if precise_p and local_prob:
+    if half_pv:
+        if fold_v_descale:
+            if transpose_pv:
+                return tl.trans(
+                    tl.dot(
+                        tl.trans(V.to(tl.float16)),
+                        tl.trans(P.to(tl.float16)),
+                        tl.trans(acc),
+                    )
+                )
+            else:
+                return tl.dot(P.to(tl.float16), V.to(tl.float16), acc)
+        else:
+            if transpose_pv:
+                pv = tl.trans(
+                    tl.dot(
+                        tl.trans(V.to(tl.float16)),
+                        tl.trans(P.to(tl.float16)),
+                        out_dtype=tl.float32,
+                    )
+                )
+            else:
+                pv = tl.dot(P.to(tl.float16), V.to(tl.float16), out_dtype=tl.float32)
+            return acc + pv * v_descale
+    elif precise_p and local_prob:
         fixed = (P * (127.0 * 256.0) + 0.5).to(tl.int32)
         high = ((fixed + 128) >> 8).to(tl.int8)
         low = fixed.to(tl.int8)
@@ -1535,13 +1559,9 @@ def load_from_kvcache(
         "k_batch_stride",
         "v_batch_stride",
         "o_batch_stride",
-        "b",
         "bk",
-        "seqlen_q",
-        "seqlen_k",
         "seqlen_q_rounded",
         "seqlen_k_rounded",
-        "total_q",
     ]
 )
 def flash_varlen_fwd_kernel(
@@ -1597,7 +1617,7 @@ def flash_varlen_fwd_kernel(
     k_descale_block_stride,
     v_descale_batch_stride,
     v_descale_head_stride,
-    v_descale_block_stride,
+    v_descale_block_stride: tl.constexpr,
     # dropout
     is_dropout: tl.constexpr,
     p_dropout: tl.constexpr,
@@ -1629,7 +1649,6 @@ def flash_varlen_fwd_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
     SPLIT_D: tl.constexpr,
-    PRECISE_SHORT_K: tl.constexpr,
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
     USE_TN: tl.constexpr = False,
@@ -1670,17 +1689,6 @@ def flash_varlen_fwd_kernel(
         k_len = tl.load(seqused_k_ptr + bid).to(tl.int32)
     else:
         k_len = k_len_cache
-
-    if USE_TN and is_causal:
-        visible_k = min(k_len, max(0, (m_block + 1) * BLOCK_M + k_len - q_len))
-        needs_precise_p = visible_k <= 512
-    elif USE_TN and d == 64:
-        # Match the precision used when these short requests run alone.
-        needs_precise_p = k_len < 512
-    else:
-        needs_precise_p = k_len <= 128
-    if needs_precise_p != PRECISE_SHORT_K:
-        return
 
     # Noop CTA
     if m_block * BLOCK_M >= q_len:
@@ -1747,19 +1755,27 @@ def flash_varlen_fwd_kernel(
     else:
         alibi_slope = 0.0
 
-    if not is_causal and not is_local:
-        n_masking_steps = 1
-    elif is_even_mn:
-        n_masking_steps = tl.cdiv(BLOCK_M, BLOCK_N)
+    MASK_N: tl.constexpr = min(BLOCK_M, BLOCK_N) if is_causal and USE_TN else BLOCK_N
+    if is_local:
+        n_masking_steps = min(n_block_max - n_block_min, tl.cdiv(BLOCK_M, BLOCK_N) + 1)
+        full_blocks = n_block_max - n_masking_steps
+        mask_block_max = n_block_max
     else:
-        n_masking_steps = tl.cdiv(BLOCK_M, BLOCK_N) + 1
-
-    n_masking_steps = min(n_block_max - n_block_min, n_masking_steps)
+        # Full tiles end at the first query's boundary; only the tail needs masking.
+        if is_causal:
+            full_keys = min(k_len, m_block * BLOCK_M + k_len - q_len + 1)
+            visible_keys = min(k_len, (m_block + 1) * BLOCK_M + k_len - q_len)
+        else:
+            full_keys = k_len
+            visible_keys = k_len
+        full_blocks = max(0, full_keys) // BLOCK_N
+        mask_block_max = tl.cdiv(max(0, visible_keys), MASK_N)
+        n_masking_steps = mask_block_max - full_blocks * (BLOCK_N // MASK_N)
 
     row_idx = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_block = n_block_max - 1
+    n_block = mask_block_max - 1
     for step in tl.range(0, n_masking_steps):
-        col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        col_idx = n_block * MASK_N + tl.arange(0, MASK_N)
         if is_paged:
             bK, bV = load_from_kvcache(
                 col_idx,
@@ -1775,7 +1791,7 @@ def flash_varlen_fwd_kernel(
                 boundary_check=True,
             )
         else:
-            start_n = n_block * BLOCK_N
+            start_n = n_block * MASK_N
             k_ptr_seq = k_ptr_base + k_bos * k_row_stride
             v_ptr_seq = v_ptr_base + k_bos * k_row_stride
             gK = tl.make_block_ptr(
@@ -1783,7 +1799,7 @@ def flash_varlen_fwd_kernel(
                 shape=(k_len, d),
                 strides=(k_row_stride, 1),
                 offsets=(start_n, 0),
-                block_shape=(BLOCK_N, BLOCK_K),
+                block_shape=(MASK_N, BLOCK_K),
                 order=(0, 1),
             )
             gV = tl.make_block_ptr(
@@ -1791,7 +1807,7 @@ def flash_varlen_fwd_kernel(
                 shape=(k_len, d),
                 strides=(k_row_stride, 1),
                 offsets=(start_n, d_start),
-                block_shape=(BLOCK_N, BLOCK_D),
+                block_shape=(MASK_N, BLOCK_D),
                 order=(0, 1),
             )
             bK = tl.load(gK, boundary_check=(0, 1), padding_option="zero")
@@ -1814,7 +1830,7 @@ def flash_varlen_fwd_kernel(
             hid,
             kv_hid,
             m_block * BLOCK_M,
-            n_block * BLOCK_N,
+            n_block * MASK_N,
         )
         if CHUNKED_QK:
             S = _int8_qk_tn_fragments(
@@ -1828,7 +1844,7 @@ def flash_varlen_fwd_kernel(
                 k_row_stride,
                 D=d,
                 BM=BLOCK_M,
-                BN=BLOCK_N,
+                BN=MASK_N,
                 IS_BORDER=True,
             )
         elif USE_TN:
@@ -1869,11 +1885,12 @@ def flash_varlen_fwd_kernel(
             rowsum_,
             softmax_scale_log2e=scale_softmax_log2,
             is_border=True,
+            local_prob=False,
         )
         if is_dropout:
             P = apply_dropout(
                 P,
-                n_block * BLOCK_N,
+                n_block * MASK_N,
                 m_block * BLOCK_M,
                 k_len,
                 bid,
@@ -1885,24 +1902,24 @@ def flash_varlen_fwd_kernel(
                 encode_dropout_in_sign_bit=False,
                 NUM_HEADS=h,
                 BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
+                BLOCK_N=MASK_N,
             )
             p_tile_max = tl.max(P, 1)
 
-        # varlen PV uses dynamically quantized INT8 P and INT8 V.
         acc_ = _int8_pv_dot(
             P,
             p_tile_max,
             bV,
             acc_,
             v_descale,
-            precise_p=precise_p or PRECISE_SHORT_K,
+            half_pv=True,
+            fold_v_descale=v_descale_block_stride == 0,
             transpose_pv=USE_TN,
         )
         n_block -= 1
 
     for n_block in tl.range(
-        n_block_max - n_masking_steps - 1,
+        full_blocks - 1,
         n_block_min - 1,
         step=-1,
         num_stages=1 if is_paged else num_stages,
@@ -2020,6 +2037,7 @@ def flash_varlen_fwd_kernel(
             rowsum_,
             softmax_scale_log2e=scale_softmax_log2,
             is_border=is_local,
+            local_prob=False,
         )
         if is_dropout:
             P = apply_dropout(
@@ -2039,14 +2057,14 @@ def flash_varlen_fwd_kernel(
                 BLOCK_N=BLOCK_N,
             )
             p_tile_max = tl.max(P, 1)
-        # non-masking varlen PV runs as INT8 P * INT8 V.
         acc_ = _int8_pv_dot(
             P,
             p_tile_max,
             bV,
             acc_,
             v_descale,
-            precise_p=precise_p or PRECISE_SHORT_K,
+            half_pv=True,
+            fold_v_descale=v_descale_block_stride == 0,
             transpose_pv=USE_TN,
         )
 
@@ -2058,7 +2076,16 @@ def flash_varlen_fwd_kernel(
     )
     inv_sum = tl.where(rowsum_ == 0 | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
 
-    acc_ *= inv_sum[:, None]
+    if v_descale_block_stride == 0:
+        # A head-wise V scale commutes with the complete weighted sum.
+        final_v_descale = tl.load(
+            v_descale_ptr
+            + bid * v_descale_batch_stride
+            + kv_hid * v_descale_head_stride
+        )
+    else:
+        final_v_descale = 1.0
+    acc_ *= (inv_sum * final_v_descale)[:, None]
 
     out = acc_.to(o_ptr.type.element_ty)  # noqa
 
@@ -2085,6 +2112,40 @@ def flash_varlen_fwd_kernel(
         lse,
         mask=(lse_row_offset < (lse_offset + q_len)) & (d_split == 0),
     )
+
+
+def prune_varlen_int8_configs(configs, named_args, **kwargs):
+    if named_args["d"] <= 128:
+        return configs
+    # A full D256 accumulator needs smaller tiles to bound registers and shared memory.
+    return [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_M"] <= 32 and config.kwargs["BLOCK_N"] <= 64
+    ]
+
+
+flash_varlen_fwd_tuned_kernel = libentry()(
+    libtuner(
+        configs=runtime.get_tuned_config("flash_varlen_w8a8_int8"),
+        key=[
+            "seqlen_q",
+            "seqlen_k",
+            "total_q",
+            "b",
+            "h",
+            "d",
+            "q_row_stride",
+            "k_row_stride",
+            "q_head_stride",
+            "k_head_stride",
+            "is_causal",
+            "v_descale_block_stride",
+        ],
+        prune_configs_by={"early_config_prune": prune_varlen_int8_configs},
+        use_cuda_graph=True,
+    )(flash_varlen_fwd_kernel.fn)
+)
 
 
 def CHECK_DEVICE(x):
@@ -2544,6 +2605,31 @@ def _get_varlen_fwd_config(
                 scenario="noaddropt;disable_int8_opt",
                 num_stages=2,
             )
+    if (
+        runtime.device.vendor_name == "metax"
+        and not is_paged
+        and is_standard_attention
+        and not is_alibi
+        and not is_softcap
+        and not is_dropout
+        and head_size in (96, 256)
+    ):
+        # Full-D PV avoids repeating QK for each output slice on these dimensions.
+        cfg_params.update(
+            BLOCK_M=32,
+            BLOCK_N=64,
+            BLOCK_K=triton.next_power_of_2(head_size),
+            BLOCK_D=triton.next_power_of_2(head_size),
+            SPLIT_D=False,
+            USE_TN=True,
+            CHUNKED_QK=False,
+            num_warps=4,
+            num_stages=1,
+        )
+    elif cfg_params["USE_TN"] and head_size == 192 and max_seqlen_q >= 1024:
+        cfg_params.update(BLOCK_M=32, BLOCK_N=64, BLOCK_D=256, SPLIT_D=False)
+    else:
+        return cfg_params
     return cfg_params
 
 
@@ -2949,33 +3035,25 @@ def mha_varlan_fwd(
             max_seqlen_k,
         )
         num_d_splits = triton.cdiv(head_size, cfg_params["BLOCK_D"])
-        grid = (
-            triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"]),
-            batch_size,
-            num_heads * num_d_splits,
-        )
-        kernel = flash_varlen_fwd_kernel[grid]
+        if cfg_params["USE_TN"] and not cfg_params["SPLIT_D"]:
+            grid = lambda meta: (
+                triton.cdiv(max_seqlen_q, meta["BLOCK_M"]),
+                batch_size,
+                num_heads,
+            )
+            kernel = flash_varlen_fwd_tuned_kernel[grid]
+            for name in ("BLOCK_M", "BLOCK_N", "num_warps", "num_stages"):
+                cfg_params.pop(name)
+        else:
+            grid = (
+                triton.cdiv(max_seqlen_q, cfg_params["BLOCK_M"]),
+                batch_size,
+                num_heads * num_d_splits,
+            )
+            kernel = flash_varlen_fwd_kernel[grid]
 
         logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
-        if max_seqlen_k <= 128 or (
-            cfg_params["USE_TN"]
-            and head_size == 64
-            and not is_causal
-            and max_seqlen_k < 512
-        ):
-            short_k_modes = (True,)
-        elif cfg_params["USE_TN"] and is_causal:
-            short_k_modes = (False, True)
-        elif (
-            not is_paged
-            and seqused_k is None
-            and k.shape[0] == batch_size * max_seqlen_k
-        ):
-            short_k_modes = (False,)
-        else:
-            short_k_modes = (False, True)
-        for precise_short_k in short_k_modes:
-            kernel(*args, PRECISE_SHORT_K=precise_short_k, **cfg_params)
+        kernel(*args, **cfg_params)
 
         if seqlenq_ngroups_swapped:
             out = out.reshape(

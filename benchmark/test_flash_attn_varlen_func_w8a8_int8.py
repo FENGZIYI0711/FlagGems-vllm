@@ -43,6 +43,36 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
     """vLLM v0.19.0 standard attention workloads with the Gems benchmark runner."""
 
     def set_shapes(self, shape_file_path=None):
+        if vendor_name == "metax":
+            self.shapes = []
+            # Preserve PR878's regular workloads rather than substituting paged GQA.
+            for batch, length, heads, dim in (
+                (1, 512, 16, 128),
+                (1, 512, 32, 64),
+                (2, 512, 16, 128),
+                (1, 2048, 32, 64),
+                (4, 4096, 32, 64),
+                (8, 8192, 16, 128),
+                (1, 512, 16, 96),
+                (1, 1024, 16, 192),
+                (1, 2048, 8, 256),
+            ):
+                for causal in (False, True):
+                    self.shapes.append(
+                        (
+                            tuple(range(0, (batch + 1) * length, length)),
+                            (length,) * batch,
+                            heads,
+                            heads,
+                            dim,
+                            16,
+                            batch * ((length + 15) // 16),
+                            False,
+                            None,
+                            causal,
+                        )
+                    )
+            return
         # vllm/benchmarks/attention_benchmarks/configs/standard_attention.yaml
         # Each group is (request count, query length, total KV length).
         # Keep all 18 workloads in both core and comprehensive modes.
@@ -75,7 +105,18 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
             self.shapes.append((cuq, klens, 32, 8, 128, 16, num_blocks, False, None))
 
     def flash_attn_varlen_input_fn(self, config, dtype, device):
-        args = list(super().flash_attn_varlen_input_fn(config, dtype, device))
+        args = list(super().flash_attn_varlen_input_fn(config[:9], dtype, device))
+        if vendor_name == "metax":
+            args[1] = args[1].flatten(0, 1)
+            args[2] = args[2].flatten(0, 1)
+            args[6] = torch.tensor(
+                (0, *accumulate(config[1])), device=device, dtype=torch.int32
+            )
+            args[7] = None
+            args[11] = config[9]
+            args[17] = None
+            return tuple(args)
+
         # Match vLLM runner._build_common_attn_metadata: distinct sequential
         # cache blocks per request, including unused slots for shorter requests.
         batch = len(config[1])
@@ -149,6 +190,8 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
             reference_args = (*dequantized, *bf16_args[3:])
             if vendor_name == "thead":
                 baseline = _varlen_fa3_baseline(reference_args, int8_args)
+            elif vendor_name == "metax":
+                baseline = varlen_metax_fa2_baseline(reference_args, int8_args)
             else:
                 baseline = _varlen_bf16_baseline(reference_args, int8_args)
             torch.testing.assert_close(
@@ -176,7 +219,23 @@ def _varlen_int8(bf16_args, int8_args):
     return flaggems_vllm.flash_attn_varlen_func(*int8_args[:-1], **int8_args[-1])
 
 
-@pytest.mark.skipif(vendor_name not in ("hygon", "thead"), reason="Hygon/PPU-only API")
+def varlen_metax_fa2_baseline(bf16_args, int8_args):
+    from flash_attn import flash_attn_varlen_func
+
+    return flash_attn_varlen_func(
+        *bf16_args[:3],
+        bf16_args[4],
+        bf16_args[6],
+        bf16_args[3],
+        bf16_args[5],
+        softmax_scale=bf16_args[10],
+        causal=bf16_args[11],
+    )
+
+
+@pytest.mark.skipif(
+    vendor_name not in ("hygon", "thead", "metax"), reason="Hygon/PPU/MetaX API"
+)
 @pytest.mark.flash_attn_varlen_func_w8a8_int8
 def test_flash_attn_varlen_func_w8a8_int8():
     if vendor_name == "thead":
@@ -184,6 +243,11 @@ def test_flash_attn_varlen_func_w8a8_int8():
             pytest.skip("PPU vLLM FA3 is unavailable")
         print("Baseline: vLLM BF16 FA3; scheduler setup and quantization excluded.")
         baseline = _varlen_fa3_baseline
+    elif vendor_name == "metax":
+        pytest.importorskip("flash_attn")
+        torch.manual_seed(0)
+        print("Baseline: installed MetaX BF16 FA2; input quantization excluded.")
+        baseline = varlen_metax_fa2_baseline
     else:
         print(
             "Baseline: FlagGems-vllm BF16; input quantization is excluded from timing."
