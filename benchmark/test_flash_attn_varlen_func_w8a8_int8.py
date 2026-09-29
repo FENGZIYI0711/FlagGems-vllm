@@ -126,6 +126,8 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
         return tuple(args)
 
     def get_input_iter(self, dtype):
+        if vendor_name == "metax":
+            torch.manual_seed(0)
         for bf16_args in super().get_input_iter(dtype):
             q, k, v = bf16_args[:3]
             batch = bf16_args[4].numel() - 1
@@ -220,7 +222,7 @@ def _varlen_int8(bf16_args, int8_args):
 
 
 def varlen_metax_fa2_baseline(bf16_args, int8_args):
-    from flash_attn import flash_attn_varlen_func
+    from vllm_metax.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
     return flash_attn_varlen_func(
         *bf16_args[:3],
@@ -244,9 +246,9 @@ def test_flash_attn_varlen_func_w8a8_int8():
         print("Baseline: vLLM BF16 FA3; scheduler setup and quantization excluded.")
         baseline = _varlen_fa3_baseline
     elif vendor_name == "metax":
-        pytest.importorskip("flash_attn")
+        pytest.importorskip("vllm_metax.v1.attention.backends.fa_utils")
         torch.manual_seed(0)
-        print("Baseline: installed MetaX BF16 FA2; input quantization excluded.")
+        print("Baseline: vLLM-MetaX BF16 FA2; input quantization excluded.")
         baseline = varlen_metax_fa2_baseline
     else:
         print(
