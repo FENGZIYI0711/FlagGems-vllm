@@ -17,7 +17,7 @@ import torch
 
 import flaggems_vllm
 
-from .test_flash_attn_varlen_func_w8a8_int8 import _run_case
+from .test_flash_attn_varlen_func_w8a8_int8 import _inputs, _reference, _run_case
 
 pytestmark = [
     pytest.mark.flash_attn_varlen_func_w8a8_int8,
@@ -64,9 +64,43 @@ def test_metax_strided_ragged(causal, broadcast_scales):
     )
 
 
-@pytest.mark.parametrize("window,cap", [((31, 0), 0), ((32, 9), 3)])
-def test_metax_score_modifiers(window, cap):
-    _run_case([129, 513], [257, 769], window=window, cap=cap)
+@pytest.mark.parametrize(
+    "window,cap", [((31, 0), 0), ((32, 9), 3), ((31, -1), 0), ((-1, 17), 3)]
+)
+@pytest.mark.parametrize("dim", [64, 96, 128])
+@pytest.mark.parametrize(
+    "qlens,klens", [([129, 513], [257, 769]), ([17, 129], [145, 257])]
+)
+def test_metax_score_modifiers(window, cap, dim, qlens, klens):
+    _run_case(qlens, klens, dim=dim, window=window, cap=cap)
+
+
+@pytest.mark.parametrize("window,cap", [((31, -1), 0), ((-1, 17), 3)])
+@pytest.mark.parametrize("dim", [64, 96, 128])
+@pytest.mark.parametrize("query_length", [128, 256])
+def test_metax_uniform_single_sided_window(window, cap, dim, query_length):
+    qlens, klens = [query_length] * 2, [256] * 2
+    q, qs, qr, cuq = _inputs(qlens, 4, dim)
+    k, ks, kr, cuk = _inputs(klens, 4, dim)
+    v, vs, vr, _ = _inputs(klens, 4, dim)
+    v, vs, vr = -v, vs * 1.7, -vr * 1.7
+    # Omitting LSE selects the existing dense dispatcher for D64/D128.
+    actual = flaggems_vllm.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        query_length,
+        cuq,
+        256,
+        cuk,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
+        window_size=window,
+        softcap=cap,
+    )
+    expected, _ = _reference(qr, kr, vr, qlens, klens, False, window, cap)
+    torch.testing.assert_close(actual.float(), expected, atol=0.025, rtol=0.025)
 
 
 @pytest.mark.parametrize("dim", [8, 24, 32])

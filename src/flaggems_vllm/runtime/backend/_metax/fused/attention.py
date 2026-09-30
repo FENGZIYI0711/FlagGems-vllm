@@ -163,9 +163,18 @@ def apply_mask(
     need_mask = is_causal | is_local | (not is_even_mn)
     # need_mask: tl.constexpr = is_causal | is_local
     if need_mask:
-        col_lb = max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left)
-        col_rb = min(
-            max_seqlen_k - 1, row_idx + max_seqlen_k - max_seqlen_q + window_size_right
+        col_lb = tl.where(
+            window_size_left < 0,
+            0,
+            tl.maximum(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left),
+        )
+        col_rb = tl.where(
+            window_size_right < 0,
+            max_seqlen_k - 1,
+            tl.minimum(
+                max_seqlen_k - 1,
+                row_idx + max_seqlen_k - max_seqlen_q + window_size_right,
+            ),
         )
 
         if is_causal:
@@ -627,14 +636,14 @@ def flash_fwd_kernel(
     num_m_blocks = tl.cdiv(seqlen_q, BLOCK_M)
 
     col_min = 0
-    if is_local:
+    if is_local and window_size_left >= 0:
         col_min = max(0, m_block * BLOCK_M + seqlen_k - seqlen_q - window_size_left)
         if not IS_EVEN_MN:
             # round left
             col_min = (col_min // BLOCK_N) * BLOCK_N
 
     col_max = seqlen_k
-    if is_causal or is_local:
+    if is_causal or (is_local and window_size_right >= 0):
         col_max += (m_block - num_m_blocks + 1) * BLOCK_M
         if is_local:
             col_max += window_size_right
@@ -1697,7 +1706,7 @@ def flash_varlen_fwd_kernel(
     # is_even_mn = (q_len % BLOCK_M == 0) and (k_len % BLOCK_N == 0)
     is_even_mn: tl.constexpr = False
 
-    if is_local:
+    if is_local and window_size_left >= 0:
         n_block_min = max(
             0, (m_block * BLOCK_M + k_len - q_len - window_size_left) // BLOCK_N
         )
@@ -1705,7 +1714,7 @@ def flash_varlen_fwd_kernel(
         n_block_min = 0
 
     n_block_max = tl.cdiv(k_len, BLOCK_N)
-    if is_causal or is_local:
+    if is_causal or (is_local and window_size_right >= 0):
         n_block_max = min(
             n_block_max,
             tl.cdiv(
@@ -2736,10 +2745,10 @@ def mha_varlan_fwd(
     # check disable swa
     if window_size_left >= max_seqlen_k:
         window_size_left = -1
-    if window_size_right >= max_seqlen_k:
+    if window_size_right >= max_seqlen_q:
         window_size_right = -1
 
-    is_local = window_size_left >= 0
+    is_local = window_size_left >= 0 or (window_size_right >= 0 and not is_causal)
 
     seqlenq_ngroups_swapped = (
         max_seqlen_q == 1
@@ -3116,7 +3125,7 @@ def mha_fwd(
     ), "Number of heads in key/value must divide number of heads in query"
     if window_size_left >= seqlen_k:
         window_size_left = -1
-    if window_size_right >= seqlen_k:
+    if window_size_right >= seqlen_q:
         window_size_right = -1
     if seqlen_q == 1 and alibi_slopes is None:
         is_causal = False
@@ -3124,7 +3133,7 @@ def mha_fwd(
         window_size_right = 0
 
     is_causal = window_size_left < 0 and window_size_right == 0
-    is_local = window_size_left >= 0 and window_size_right >= 0
+    is_local = (window_size_left >= 0 or window_size_right >= 0) and not is_causal
 
     seqlenq_ngroups_swapped = (
         seqlen_q == 1
@@ -3493,6 +3502,14 @@ def flash_attn_varlen_func_w8a8_int8(
     cp_tot_seqused_k=None,
     fa_version: int = 2,
 ):
+    """MetaX INT8 attention with FP32 softmax, for inference only.
+
+    Paged KV and GQA use FP16 PV and support head dimensions 64 and 128.
+    Descales index
+    logical 128-token blocks, independently of physical cache pages. The
+    output defaults to BF16 or uses a supplied FP16/BF16 buffer. Forward
+    inference only; unsupported training and scheduling modes raise errors.
+    """
     if dropout_p != 0.0:
         raise NotImplementedError("dropout is not supported by this inference path")
     if return_attn_probs:
@@ -3508,9 +3525,9 @@ def flash_attn_varlen_func_w8a8_int8(
             "This W8A8 INT8 attention implementation only supports MetaX"
         )
     if fa_version != 2:
-        raise RuntimeError("Only FA2 is implemented.")
-    if num_splits > 0:
-        raise RuntimeError("num_splits > 0 is not implemented.")
+        raise NotImplementedError("Only FA2 is implemented.")
+    if num_splits != 0:
+        raise NotImplementedError("Explicit num_splits is not implemented.")
     assert (
         cu_seqlens_k is not None or seqused_k is not None
     ), "cu_seqlens_k or seqused_k must be provided"
@@ -3525,10 +3542,12 @@ def flash_attn_varlen_func_w8a8_int8(
 
     if not isinstance(max_seqlen_q, int) or not isinstance(max_seqlen_k, int):
         raise TypeError("max_seqlen_q and max_seqlen_k must be Python integers")
-    if max_seqlen_q <= 0 or max_seqlen_k <= 0:
-        raise NotImplementedError("empty sequences are not supported")
+    if max_seqlen_q < 0 or max_seqlen_k < 0:
+        raise ValueError("max_seqlen_q and max_seqlen_k must be nonnegative")
     if q.ndim != 3:
         raise ValueError("q must have shape [total_q, heads, head_dim]")
+    if max_seqlen_q == 0 and q.shape[0] != 0:
+        raise ValueError("max_seqlen_q must be positive when q is nonempty")
     expected_kv_ndim = 4 if block_table is not None else 3
     if k.ndim != expected_kv_ndim or v.ndim != expected_kv_ndim:
         raise ValueError("k and v rank does not match the selected cache layout")
@@ -3566,12 +3585,18 @@ def flash_attn_varlen_func_w8a8_int8(
             raise TypeError("out must have dtype torch.float16 or torch.bfloat16")
         if out.stride(-1) != 1:
             raise NotImplementedError("out must be contiguous in head_dim")
-        if out.data_ptr() in (q.data_ptr(), k.data_ptr(), v.data_ptr()):
+        if out.numel() and out.data_ptr() in (
+            q.data_ptr(),
+            k.data_ptr(),
+            v.data_ptr(),
+        ):
             raise ValueError("out must not alias q, k, or v")
 
     num_heads_k = k.shape[2] if block_table is not None else k.shape[1]
-    if q.shape[1] != num_heads_k:
-        raise NotImplementedError("GQA is not supported by this W8A8 path")
+    if num_heads_k <= 0 or q.shape[1] <= 0 or q.shape[1] % num_heads_k != 0:
+        raise ValueError("The number of KV heads must divide the number of query heads")
+    if q.shape[1] != num_heads_k and head_size not in (64, 128):
+        raise NotImplementedError("GQA supports head dimensions 64 and 128")
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -3604,6 +3629,75 @@ def flash_attn_varlen_func_w8a8_int8(
     ):
         raise ValueError(
             "block_table must be contiguous in its last dimension with shape [batch, pages]"
+        )
+    if alibi_slopes is not None and (
+        alibi_slopes.device != q.device
+        or alibi_slopes.dtype != torch.float32
+        or alibi_slopes.stride(-1) != 1
+        or alibi_slopes.shape not in ((q.shape[1],), (batch_size, q.shape[1]))
+    ):
+        raise ValueError(
+            "alibi_slopes must be FP32 [heads] or [batch, heads] on q.device"
+        )
+    if q.shape[0] == 0 or max_seqlen_k == 0:
+        if out is None:
+            out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+        lse = (
+            torch.empty((q.shape[1], q.shape[0]), dtype=torch.float32, device=q.device)
+            if return_softmax_lse
+            else None
+        )
+        if q.shape[0] != 0:
+            from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
+                fill_tensor,
+            )
+
+            fill_tensor(out, 0.0)
+            if return_softmax_lse:
+                fill_tensor(lse, float("inf"))
+        return (out, lse) if return_softmax_lse else out
+    if head_size in (64, 128) and (
+        block_table is not None or q.shape[1] != num_heads_k
+    ):
+        from flaggems_vllm.runtime.backend._metax.fused.paged_attention import (
+            launch_paged_int8_attention,
+        )
+
+        normalized_descales = []
+        for descale, heads, max_length, name in (
+            (q_descale, q.shape[1], max_seqlen_q, "q_descale"),
+            (k_descale, num_heads_k, max_seqlen_k, "k_descale"),
+            (v_descale, num_heads_k, max_seqlen_k, "v_descale"),
+        ):
+            # Padded maximum lengths need not allocate unused logical scale blocks.
+            blocks = (
+                descale.shape[2]
+                if descale is not None and descale.ndim == 3
+                else triton.cdiv(max_length, 128)
+            )
+            normalized_descales.append(
+                _normalize_dense_descale(
+                    descale, batch_size, heads, blocks, q.device, name
+                )
+            )
+        return launch_paged_int8_attention(
+            q,
+            k,
+            v,
+            max_seqlen_q,
+            cu_seqlens_q,
+            max_seqlen_k,
+            cu_seqlens_k,
+            seqused_k,
+            softmax_scale,
+            causal,
+            real_window_size,
+            softcap,
+            alibi_slopes,
+            block_table,
+            return_softmax_lse,
+            out,
+            *normalized_descales,
         )
     uniform_nonpaged = (
         head_size in (64, 128)
