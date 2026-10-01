@@ -25,18 +25,10 @@ DESCALE_BLOCK = 128
 pytestmark = [
     pytest.mark.flash_attn_varlen_func_w8a8_int8,
     pytest.mark.skipif(
-        flaggems_vllm.vendor_name not in ("hygon", "thead", "metax"),
-        reason="Hygon/PPU/MetaX API",
+        flaggems_vllm.vendor_name not in ("hygon", "thead"),
+        reason="Hygon/PPU-only API",
     ),
 ]
-
-
-@pytest.fixture(autouse=True)
-def exact_reference_matmul(monkeypatch):
-    if flaggems_vllm.vendor_name != "metax":
-        return
-    # TF32 reference rounding can exceed the existing FP32 LSE tolerance.
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
 
 
 def _inputs(lengths, heads, dim, broadcast_scales=False):
@@ -264,7 +256,7 @@ def test_export_signature_and_empty():
         flaggems_vllm.flash_attn_varlen_func
     )
     assert flaggems_vllm.ops.flash_attn_varlen_func_w8a8_int8 is op
-    backend = f"_{flaggems_vllm.vendor_name}"
+    backend = "_hygon" if flaggems_vllm.vendor_name == "hygon" else "_thead"
     assert op.__module__.startswith(f"flaggems_vllm.runtime.backend.{backend}.")
     assert op in [entry[1] for entry in flaggems_vllm._FULL_CONFIG]
     q = torch.empty((0, 4, 64), device="cuda", dtype=torch.int8)
@@ -472,8 +464,7 @@ def test_paged_long_query_empty_kv():
 
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_paged_unused_cache_and_table_slots(strided):
     _run_case(
@@ -490,8 +481,7 @@ def test_paged_unused_cache_and_table_slots(strided):
 
 
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_paged_shared_cache_workspace_fallback():
     qlens, klens = [129, 5, 1], [512, 512, 512]
@@ -532,16 +522,14 @@ def test_paged_shared_cache_workspace_fallback():
     ],
 )
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_paged_worklist_request_classes(qlens, klens):
     _run_case(qlens, klens, dim=128, heads=8, kvheads=2, causal=True, paged=True)
 
 
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_paged_worklist_without_long_queries():
     _run_case(
@@ -559,8 +547,7 @@ def test_paged_worklist_without_long_queries():
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("window", [(-1, -1), (17, 3)])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_paged_mask_phase_boundaries(causal, window):
     _run_case(
@@ -580,8 +567,7 @@ def test_paged_mask_phase_boundaries(causal, window):
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 @pytest.mark.parametrize("query_len", [4101, 8193])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_paged_large_query_tile(causal, broadcast_scales, query_len):
     _run_case(
@@ -599,8 +585,7 @@ def test_paged_large_query_tile(causal, broadcast_scales, query_len):
 @pytest.mark.parametrize("value", [-127, 127])
 @pytest.mark.parametrize("q_scale_factor", [0.03, 0.1])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_paged_long_query_constant_v(value, q_scale_factor):
     # Constant V makes accumulation drift visible even when QK is nearly uniform.
@@ -634,8 +619,7 @@ def test_paged_long_query_constant_v(value, q_scale_factor):
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_paged_single_query_gqa(batch, broadcast_scales, causal):
     _run_case(
@@ -672,8 +656,7 @@ def test_paged_gqa_without_aiu(monkeypatch, causal):
 
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_paged_gqa_softcap_alibi(broadcast_scales):
     torch.manual_seed(779)
@@ -697,8 +680,7 @@ def test_paged_gqa_softcap_alibi(broadcast_scales):
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_small_batch_decode_split_kv(batch, dtype, broadcast_scales, causal):
     _run_case(
@@ -715,8 +697,7 @@ def test_small_batch_decode_split_kv(batch, dtype, broadcast_scales, causal):
 
 
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_small_batch_decode_split_kv_empty_request():
     _run_case(
@@ -733,8 +714,7 @@ def test_small_batch_decode_split_kv_empty_request():
 
 @pytest.mark.parametrize("cap,with_alibi", [(4, False), (0, True), (4, True)])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_small_batch_decode_split_kv_modifiers(cap, with_alibi):
     torch.manual_seed(779)
@@ -757,8 +737,7 @@ def test_small_batch_decode_split_kv_modifiers(cap, with_alibi):
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_paged_two_query_gqa(batch, kv_length, broadcast_scales, causal):
     _run_case(
@@ -774,8 +753,7 @@ def test_paged_two_query_gqa(batch, kv_length, broadcast_scales, causal):
 
 
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_small_batch_decode_split_kv_strided():
     _run_case(
@@ -794,8 +772,7 @@ def test_small_batch_decode_split_kv_strided():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("max_query_bound", [None, 4096])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_reordered_causal_gqa_ragged_empty_masked(dtype, max_query_bound):
     _run_case(
@@ -814,8 +791,7 @@ def test_reordered_causal_gqa_ragged_empty_masked(dtype, max_query_bound):
 
 @pytest.mark.parametrize("batch", [33, 65])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_reordered_worklist_many_requests(batch):
     _run_case(
@@ -835,8 +811,7 @@ def test_reordered_worklist_many_requests(batch):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_packed_gqa_small_kv_boundaries(kv_length, causal, dtype):
     _run_case(
@@ -854,8 +829,7 @@ def test_packed_gqa_small_kv_boundaries(kv_length, causal, dtype):
 @pytest.mark.parametrize("query_length", [129, 255, 511, 512])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "metax"),
-    reason="PPU/MetaX coverage",
+    flaggems_vllm.vendor_name != "thead", reason="Thead-specific coverage"
 )
 def test_folded_causal_prefill_partial_query_tiles(query_length, dtype):
     _run_case(
