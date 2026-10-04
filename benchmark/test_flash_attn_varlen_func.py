@@ -418,7 +418,7 @@ def flash_attn_varlen_metax(*args, **kwargs):
             ]
         ).to(torch.int32)
 
-    from vllm_metax.v1.attention.backends.fa_utils import flash_attn_varlen_func
+    from flash_attn import flash_attn_varlen_func
 
     return flash_attn_varlen_func(
         query,
