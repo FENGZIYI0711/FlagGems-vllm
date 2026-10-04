@@ -16,7 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.runtime import device, torch_device_fn
 from flaggems_vllm.utils import has_triton_tle_attrs, libentry
 
 if has_triton_tle_attrs(("load",), 3, 6, 0):
@@ -587,7 +587,7 @@ def flash_attn_varlen_func_w8a8_int8(
     cp_tot_seqused_k=None,
     fa_version: int = 2,
 ):
-    """PPU INT8 variable-length attention, inference forward only.
+    """Shared INT8 variable-length attention, inference forward only.
 
     Q is [total_q, heads, D]; K/V are [total_k, kv_heads, D] or paged
     [pages, page_size, kv_heads, D]. D is 64 or 128, heads must be a multiple
@@ -639,6 +639,7 @@ def flash_attn_varlen_func_w8a8_int8(
     if seqused_k is not None and block_table is None:
         raise NotImplementedError("seqused_k requires paged KV")
 
+    is_metax = device.vendor_name == "metax"
     batch = cu_seqlens_q.numel() - 1
     total, heads, dim = q.shape
     if out is None:
@@ -660,61 +661,83 @@ def flash_attn_varlen_func_w8a8_int8(
     # Do not exceed the physical-cache workspace budget for shared KV pages.
     logical_kv = (
         pack_kv
-        and common_gqa
+        and (is_metax or common_gqa)
         and max_seqlen_k > 0
         and batch * max_seqlen_k <= k.shape[0] * k.shape[1]
     )
-    use_aiu_k = logical_kv and HAS_AIU_K
+    pack_kv = logical_kv if is_metax else pack_kv
+    use_aiu_k = logical_kv and HAS_AIU_K and not is_metax
     reorder_causal = use_aiu_k and causal and left < 0 and right < 0
-    block_m = 64 if not paged and not causal and max_seqlen_q >= 512 else 16
-    fold = paged and group > 1 and group <= 16 and group & (group - 1) == 0
-    if fold:
-        block_m = 32 if max_seqlen_q > 16 else 16
-    block_n = 128 if long_query else 64
-    num_warps = 8 if block_m == 64 and dim == 128 else 4
-    num_stages = 3 if long_query else 1
-    half_pv = long_query
-    if logical_kv:
-        # A 64-column tile reduces pressure on the long-query accumulator.
-        block_m, block_n, num_warps = 64, 64, 4
-        fold = reorder_causal or max_seqlen_q > 512
-        if not use_aiu_k and max_seqlen_q >= 4096 and left < 0 and right < 0:
-            block_m = 128
-            num_stages = 2 if max_seqlen_q < 8192 else 3
-    elif common_gqa and max_seqlen_q <= 16:
-        parallel_heads = batch * kv_heads
-        if max_seqlen_q > 4:
-            # Reuse each KV tile across more short-query rows.
-            block_m, block_n, num_stages, half_pv = 32, 128, 3, True
-            num_stages = 2 if left < 0 and right < 0 else 3
-        elif max_seqlen_q == 1 and parallel_heads <= 64:
-            block_n, num_warps, half_pv = 128, 8, True
-        elif left < 0 and right < 0:
-            # One/two-token GQA uses at most eight rows; avoid padded work.
-            block_m = 8 if max_seqlen_q <= 2 else 16
-            block_n, num_warps, num_stages = 128, 2, 2
-        elif parallel_heads > 128:
-            block_n = 128
-    split_kv = (
-        common_gqa
-        and max_seqlen_q == 1
-        and batch * kv_heads <= SPLIT_KV_MAX_PARALLEL_HEADS.value
-        and max_seqlen_k >= SPLIT_KV_MIN_LENGTH.value
-        and left < 0
-        and right < 0
-    )
-    if split_kv:
-        # More CTAs improve occupancy when one-token decode has few KV heads.
-        block_m, block_n, num_warps, num_stages, half_pv = 8, 128, 2, 2, False
+    if is_metax:
+        fold = max_seqlen_q <= 16 and 1 < group <= 16 and group & (group - 1) == 0
+        block_m = 32 if fold and max_seqlen_q > 4 else 16
+        block_m = 64 if max_seqlen_q >= 128 else block_m
+        block_n = 128 if max_seqlen_k >= 512 else 64
+        num_warps, num_stages, half_pv = 4, 1, True
+        block_m, block_n, num_warps = (
+            (32, 64, 2) if dim == 128 and logical_kv else (block_m, block_n, num_warps)
+        )
+        parallel_heads = batch * (kv_heads if fold else heads)
+        if left < 0 and right < 0 and max_seqlen_q <= 4 and max_seqlen_k >= 512:
+            splits = 4 if parallel_heads <= 128 else 2
+        elif left < 0 and right < 0 and 4 < max_seqlen_q <= 16 and max_seqlen_k >= 2048:
+            splits = 2
+        else:
+            splits = 1
+        split_kv = splits > 1
+    else:
+        block_m = 64 if not paged and not causal and max_seqlen_q >= 512 else 16
+        fold = paged and group > 1 and group <= 16 and group & (group - 1) == 0
+        if fold:
+            block_m = 32 if max_seqlen_q > 16 else 16
+        block_n = 128 if long_query else 64
+        num_warps = 8 if block_m == 64 and dim == 128 else 4
+        num_stages = 3 if long_query else 1
+        half_pv = long_query
+        if logical_kv:
+            # A 64-column tile reduces pressure on the long-query accumulator.
+            block_m, block_n, num_warps = 64, 64, 4
+            fold = reorder_causal or max_seqlen_q > 512
+            if not use_aiu_k and max_seqlen_q >= 4096 and left < 0 and right < 0:
+                block_m = 128
+                num_stages = 2 if max_seqlen_q < 8192 else 3
+        elif common_gqa and max_seqlen_q <= 16:
+            parallel_heads = batch * kv_heads
+            if max_seqlen_q > 4:
+                # Reuse each KV tile across more short-query rows.
+                block_m, block_n, num_stages, half_pv = 32, 128, 3, True
+                num_stages = 2 if left < 0 and right < 0 else 3
+            elif max_seqlen_q == 1 and parallel_heads <= 64:
+                block_n, num_warps, half_pv = 128, 8, True
+            elif left < 0 and right < 0:
+                # One/two-token GQA uses at most eight rows; avoid padded work.
+                block_m = 8 if max_seqlen_q <= 2 else 16
+                block_n, num_warps, num_stages = 128, 2, 2
+            elif parallel_heads > 128:
+                block_n = 128
+        split_kv = (
+            common_gqa
+            and max_seqlen_q == 1
+            and batch * kv_heads <= SPLIT_KV_MAX_PARALLEL_HEADS.value
+            and max_seqlen_k >= SPLIT_KV_MIN_LENGTH.value
+            and left < 0
+            and right < 0
+        )
+        if split_kv:
+            # More CTAs improve occupancy when one-token decode has few KV heads.
+            block_m, block_n, num_warps, num_stages, half_pv = 8, 128, 2, 2, False
+        splits = DECODE_KV_SPLITS.value if split_kv else 1
     query_tile = block_m // group if fold else block_m
     grid_heads = kv_heads if fold else heads
-    compact = paged and max_seqlen_q > 16 and total * 2 < batch * max_seqlen_q
-    split_queries = logical_kv and compact
+    compact = (
+        (paged or is_metax) and max_seqlen_q > 16 and total * 2 < batch * max_seqlen_q
+    )
+    split_queries = logical_kv and compact and not is_metax
     tile_pitch = triton.next_power_of_2(triton.cdiv(max_seqlen_q, query_tile))
     split_queries = split_queries and batch * tile_pitch < 2**31
     if split_queries:
         compact = False
-    elif logical_kv and compact:
+    elif logical_kv and compact and not is_metax:
         num_stages = 2
     work_capacity = triton.cdiv(total, query_tile) + batch - 1
     work = None
@@ -728,16 +751,16 @@ def flash_attn_varlen_func_w8a8_int8(
         kernel_out, kernel_stats = out, lse
         if split_kv:
             kernel_out = torch.empty(
-                (DECODE_KV_SPLITS.value, total, heads, dim),
+                (splits, total, heads, dim),
                 dtype=torch.float32,
                 device=q.device,
             )
             kernel_stats = torch.empty(
-                (DECODE_KV_SPLITS.value, 2, heads, total),
+                (splits, 2, heads, total),
                 dtype=torch.float32,
                 device=q.device,
             )
-            grid = (grid[0] * DECODE_KV_SPLITS.value, grid[1], grid[2])
+            grid = (grid[0] * splits, grid[1], grid[2])
         if split_queries:
             work = torch.empty((work_capacity + 1,), dtype=torch.int32, device=q.device)
             _flash_int8_prepare_worklist[(batch,)](
@@ -856,16 +879,17 @@ def flash_attn_varlen_func_w8a8_int8(
                 HALF_PV=half_pv,
                 ASYNC_K=use_aiu_k and not short_phase,
                 REORDER_CAUSAL=reorder_phase,
-                TAIL_N=BOUNDARY_KV_TILE.value,
-                KV_SPLITS=DECODE_KV_SPLITS.value if split_kv else 1,
+                TAIL_N=block_n if is_metax else BOUNDARY_KV_TILE.value,
+                KV_SPLITS=splits,
                 OUT_SPLIT_STRIDE=kernel_out.stride(0) if split_kv else 0,
                 LSE_SPLIT_STRIDE=kernel_stats.stride(0) if split_kv else 0,
                 PRECISE_PV=(
-                    common_gqa
+                    not is_metax
+                    and common_gqa
                     and max_seqlen_q <= 2
                     and max_seqlen_k <= 2 * DESCALE_BLOCK.value
                 ),
-                SEPARATE_MASK=common_gqa,
+                SEPARATE_MASK=is_metax or common_gqa,
                 LOGICAL_KV=logical_kv,
                 BATCH=batch,
                 COMPACT=compact,
@@ -874,6 +898,7 @@ def flash_attn_varlen_func_w8a8_int8(
                 TILE_PITCH=tile_pitch if split_queries and not short_phase else 1,
                 SHORT_ONLY=short_phase,
                 FOLD=fold,
+                TRANSPOSE_DOT=is_metax,
                 BM=block_m,
                 BN=block_n,
                 num_warps=num_warps,
@@ -890,7 +915,7 @@ def flash_attn_varlen_func_w8a8_int8(
                 heads,
                 dim,
                 batch,
-                DECODE_KV_SPLITS.value,
+                splits,
                 out.stride(0),
                 out.stride(1),
                 return_softmax_lse,

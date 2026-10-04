@@ -3659,8 +3659,8 @@ def flash_attn_varlen_func_w8a8_int8(
     if head_size in (64, 128) and (
         block_table is not None or q.shape[1] != num_heads_k
     ):
-        from flaggems_vllm.runtime.backend._metax.fused.paged_attention import (
-            launch_paged_int8_attention,
+        from flaggems_vllm.runtime.backend._thead.fused.attention import (
+            flash_attn_varlen_func_w8a8_int8 as shared_int8_attention,
         )
 
         normalized_descales = []
@@ -3680,7 +3680,7 @@ def flash_attn_varlen_func_w8a8_int8(
                     descale, batch_size, heads, blocks, q.device, name
                 )
             )
-        return launch_paged_int8_attention(
+        return shared_int8_attention(
             q,
             k,
             v,
@@ -3688,16 +3688,18 @@ def flash_attn_varlen_func_w8a8_int8(
             cu_seqlens_q,
             max_seqlen_k,
             cu_seqlens_k,
-            seqused_k,
-            softmax_scale,
-            causal,
-            real_window_size,
-            softcap,
-            alibi_slopes,
-            block_table,
-            return_softmax_lse,
-            out,
-            *normalized_descales,
+            seqused_k=seqused_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=real_window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            block_table=block_table,
+            return_softmax_lse=return_softmax_lse,
+            out=out,
+            q_descale=normalized_descales[0],
+            k_descale=normalized_descales[1],
+            v_descale=normalized_descales[2],
         )
     uniform_nonpaged = (
         head_size in (64, 128)
