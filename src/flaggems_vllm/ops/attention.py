@@ -1291,11 +1291,11 @@ def flash_attn_varlen_func(
 
             specialized_attention = hygon_attention.flash_attn_varlen_func_w8a8_int8
         elif runtime.device.vendor_name == "metax":
-            from flaggems_vllm.runtime.backend._metax.fused import (
-                attention as metax_attention,
+            from flaggems_vllm.runtime.backend._metax.ops.flash_attention import (
+                flash_attn_varlen_func_w8a8_int8,
             )
 
-            specialized_attention = metax_attention.flash_attn_varlen_func_w8a8_int8
+            specialized_attention = flash_attn_varlen_func_w8a8_int8
         else:
             from flaggems_vllm.runtime.backend._thead.fused import (
                 attention as thead_attention,

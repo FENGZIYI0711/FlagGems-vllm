@@ -291,7 +291,8 @@ if _runtime.device.vendor_name == "thead":
     __all__.append("flash_attn_varlen_func_w8a8_int8")
 
 if _runtime.device.vendor_name == "metax":
-    from flaggems_vllm.runtime.backend._metax.fused import attention as metax_attention
+    from flaggems_vllm.runtime.backend._metax.ops.flash_attention import (
+        flash_attn_varlen_func_w8a8_int8,
+    )
 
-    flash_attn_varlen_func_w8a8_int8 = metax_attention.flash_attn_varlen_func_w8a8_int8
     __all__.append("flash_attn_varlen_func_w8a8_int8")
