@@ -3469,6 +3469,243 @@ def mha_fwd(
     return out, q, k, v, lse, philox_args, unused, p
 
 
+@triton.jit
+def paged_int8_fwd(
+    Q,
+    K,
+    V,
+    O,
+    LSE,
+    CUQ,
+    CUK,
+    USED,
+    TABLE,
+    QS,
+    KS,
+    VS,
+    ALIBI,
+    sq: tl.constexpr,
+    hq: tl.constexpr,
+    sk: tl.constexpr,
+    hk: tl.constexpr,
+    pk: tl.constexpr,
+    sv: tl.constexpr,
+    hv: tl.constexpr,
+    pv: tl.constexpr,
+    so: tl.constexpr,
+    ho: tl.constexpr,
+    qs0: tl.constexpr,
+    qs1: tl.constexpr,
+    qs2: tl.constexpr,
+    ks0: tl.constexpr,
+    ks1: tl.constexpr,
+    ks2: tl.constexpr,
+    vs0: tl.constexpr,
+    vs1: tl.constexpr,
+    vs2: tl.constexpr,
+    table_stride: tl.constexpr,
+    alibi_stride: tl.constexpr,
+    TOTAL_Q: tl.constexpr,
+    GROUP: tl.constexpr,
+    D: tl.constexpr,
+    PAGE: tl.constexpr,
+    PAGED: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    LEFT: tl.constexpr,
+    RIGHT: tl.constexpr,
+    CAP: tl.constexpr,
+    SCALE: tl.constexpr,
+    HAS_ALIBI: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    OUT_SPLIT_STRIDE: tl.constexpr,
+    LSE_SPLIT_STRIDE: tl.constexpr,
+    LOGICAL_KV: tl.constexpr,
+    BATCH: tl.constexpr,
+    COMPACT: tl.constexpr,
+    FOLD: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+):
+    program_tile = tl.program_id(0)
+    (tile, batch, head) = (
+        program_tile // KV_SPLITS,
+        tl.program_id(1),
+        tl.program_id(2),
+    )
+    split_id = program_tile % KV_SPLITS
+    kv_head = head if FOLD else head // GROUP
+    query_tile: tl.constexpr = BM // GROUP if FOLD else BM
+    if COMPACT:
+        batches = tl.arange(0, triton.next_power_of_2(BATCH))
+        begins = tl.load(CUQ + batches, batches < BATCH, 0)
+        ends = tl.load(CUQ + batches + 1, batches < BATCH, 0)
+        counts = tl.cdiv(ends - begins, query_tile)
+        cumulative = tl.cumsum(counts)
+        batch = tl.minimum(
+            tl.sum(((tile >= cumulative) & (batches < BATCH)).to(tl.int32)), BATCH - 1
+        )
+        tile -= tl.sum(tl.where(batches < batch, counts, 0))
+    q_start = tl.load(CUQ + batch)
+    nq = tl.load(CUQ + batch + 1) - q_start
+    if PAGED:
+        k_start = 0
+        nk = tl.load(USED + batch)
+    else:
+        k_start = tl.load(CUK + batch)
+        nk = tl.load(CUK + batch + 1) - k_start
+    rows = tile * BM + tl.arange(0, BM)
+    m = rows // GROUP if FOLD else rows
+    h = kv_head * GROUP + rows % GROUP if FOLD else tl.full((BM,), head, tl.int32)
+    d = tl.arange(0, D)
+    if tile * query_tile < nq:
+        q = tl.load(
+            Q + (q_start + m[:, None]) * sq + h[:, None] * hq + d[None, :],
+            m[:, None] < nq,
+            0,
+        )
+        q_scale = tl.load(QS + batch * qs0 + h * qs1 + m // 128 * qs2, m < nq, 0)
+        if not COMPACT and CAP <= 0 and (not HAS_ALIBI):
+            q_scale = q_scale * (SCALE * 1.4426950408889634)
+        maximum = tl.full((BM,), float("-inf"), tl.float32)
+        denom = tl.full((BM,), 0, tl.float32)
+        acc = tl.full((BM, D), 0, tl.float32)
+        if HAS_ALIBI:
+            slope = tl.load(ALIBI + batch * alibi_stride + h)
+        first = 0
+        end = nk
+        if LEFT >= 0:
+            first = tl.maximum(0, tile * query_tile + nk - nq - LEFT) // BN
+        if CAUSAL:
+            end = tl.minimum(end, (tile + 1) * query_tile + nk - nq)
+        if RIGHT >= 0:
+            end = tl.minimum(end, (tile + 1) * query_tile + nk - nq + RIGHT)
+        use_dense: tl.constexpr = LEFT < 0 and RIGHT < 0
+        end_block = tl.cdiv(tl.maximum(end, 0), BN)
+        if use_dense:
+            full_keys = nk
+            if CAUSAL:
+                full_keys = tl.minimum(nk, tile * query_tile + nk - nq + 1)
+            full_hi = tl.maximum(full_keys, 0) // BN
+        for mask_phase in tl.static_range(2 if use_dense else 1):
+            if use_dense:
+                begin_block = first if mask_phase == 0 else full_hi
+                stop_block = full_hi if mask_phase == 0 else end_block
+            else:
+                (begin_block, stop_block) = (first, end_block)
+            if KV_SPLITS > 1:
+                blocks_per_split = tl.cdiv(tl.cdiv(nk, BN), KV_SPLITS)
+                begin_block = tl.maximum(begin_block, split_id * blocks_per_split)
+                stop_block = tl.minimum(stop_block, (split_id + 1) * blocks_per_split)
+            for start in range(begin_block, stop_block):
+                n = start * BN + tl.arange(0, BN)
+                if LOGICAL_KV:
+                    k_row = batch * pk + n * sk
+                    v_row = batch * pv + n * sv
+                elif PAGED:
+                    if not use_dense or mask_phase == 1:
+                        page = tl.load(
+                            TABLE + batch * table_stride + n // PAGE, n < nk, 0
+                        )
+                    else:
+                        page = tl.load(TABLE + batch * table_stride + n // PAGE)
+                    k_row = page * pk + n % PAGE * sk
+                    v_row = page * pv + n % PAGE * sv
+                else:
+                    k_row = (k_start + n) * sk
+                    v_row = (k_start + n) * sv
+                if not use_dense or mask_phase == 1:
+                    k = tl.load(
+                        K + k_row[None, :] + kv_head * hk + d[:, None],
+                        n[None, :] < nk,
+                        0,
+                    )
+                else:
+                    k = tl.load(K + k_row[None, :] + kv_head * hk + d[:, None])
+                descale_block = start * BN // 128
+                ks = tl.load(KS + batch * ks0 + kv_head * ks1 + descale_block * ks2)
+                vs = tl.load(VS + batch * vs0 + kv_head * vs1 + descale_block * vs2)
+                scores = tl.trans(
+                    tl.dot(tl.trans(k), tl.trans(q), out_dtype=tl.int32)
+                ).to(tl.float32)
+                if not COMPACT and CAP <= 0 and (not HAS_ALIBI):
+                    scores = scores * (q_scale * ks)[:, None]
+                else:
+                    scores = scores * (q_scale * ks * SCALE)[:, None]
+                if CAP > 0:
+                    scores = CAP * (2 / (1 + tl.exp(2 * (-scores / CAP))) - 1)
+                position = m + nk - nq
+                if HAS_ALIBI:
+                    scores -= slope[:, None] * tl.abs(position[:, None] - n[None, :])
+                if not use_dense or mask_phase == 1:
+                    valid = n[None, :] < nk
+                    if CAUSAL:
+                        valid &= n[None, :] <= position[:, None]
+                    if LEFT >= 0:
+                        valid &= n[None, :] >= position[:, None] - LEFT
+                    if RIGHT >= 0:
+                        valid &= n[None, :] <= position[:, None] + RIGHT
+                if not (not COMPACT and CAP <= 0 and (not HAS_ALIBI)):
+                    scores = scores * 1.4426950408889634
+                if not use_dense or mask_phase == 1:
+                    scores = tl.where(valid, scores, float("-inf"))
+                tile_max = tl.max(scores, 1)
+                new_max = tl.maximum(maximum, tile_max)
+                safe_max = tl.where(new_max == float("-inf"), 0, new_max)
+                alpha = tl.exp2(maximum - safe_max)
+                p = tl.exp2(scores - safe_max[:, None])
+                denom = denom * alpha + tl.sum(p, 1)
+                if not use_dense or mask_phase == 1:
+                    v = tl.load(
+                        V + v_row[:, None] + kv_head * hv + d[None, :],
+                        n[:, None] < nk,
+                        0,
+                    )
+                else:
+                    v = tl.load(V + v_row[:, None] + kv_head * hv + d[None, :])
+                acc = _int8_pv_dot(
+                    p,
+                    1.0,
+                    v,
+                    acc * alpha[:, None],
+                    vs,
+                    half_pv=True,
+                    transpose_pv=True,
+                    fold_v_descale=vs2 == 0,
+                )
+                maximum = new_max
+        if KV_SPLITS > 1:
+            result = acc
+        else:
+            result = acc / tl.where(denom > 0, denom, 1)[:, None]
+        if vs2 == 0:
+            v_scale = tl.load(VS + batch * vs0 + kv_head * vs1, nk > 0, 0)
+            result *= v_scale
+        tl.store(
+            O
+            + split_id * OUT_SPLIT_STRIDE
+            + (q_start + m[:, None]) * so
+            + h[:, None] * ho
+            + d[None, :],
+            result,
+            m[:, None] < nq,
+        )
+        if WRITE_LSE:
+            if KV_SPLITS > 1:
+                lse_address = (
+                    LSE + split_id * LSE_SPLIT_STRIDE + h * TOTAL_Q + q_start + m
+                )
+                tl.store(lse_address, maximum, m < nq)
+                tl.store(lse_address + LSE_SPLIT_STRIDE // 2, denom, m < nq)
+            else:
+                lse = tl.where(
+                    denom > 0,
+                    maximum * 0.6931471805599453 + tl.log(denom),
+                    float("inf"),
+                )
+                tl.store(LSE + h * TOTAL_Q + q_start + m, lse, m < nq)
+
+
 def flash_attn_varlen_func_w8a8_int8(
     q,
     k,
@@ -3660,7 +3897,9 @@ def flash_attn_varlen_func_w8a8_int8(
         block_table is not None or q.shape[1] != num_heads_k
     ):
         from flaggems_vllm.runtime.backend._thead.fused.attention import (
-            flash_attn_varlen_func_w8a8_int8 as shared_int8_attention,
+            PACK_TILE,
+            _flash_int8_merge_splits,
+            _flash_int8_pack_kv,
         )
 
         normalized_descales = []
@@ -3680,27 +3919,177 @@ def flash_attn_varlen_func_w8a8_int8(
                     descale, batch_size, heads, blocks, q.device, name
                 )
             )
-        return shared_int8_attention(
-            q,
-            k,
-            v,
-            max_seqlen_q,
-            cu_seqlens_q,
-            max_seqlen_k,
-            cu_seqlens_k,
-            seqused_k=seqused_k,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=real_window_size,
-            softcap=softcap,
-            alibi_slopes=alibi_slopes,
-            block_table=block_table,
-            return_softmax_lse=return_softmax_lse,
-            out=out,
-            q_descale=normalized_descales[0],
-            k_descale=normalized_descales[1],
-            v_descale=normalized_descales[2],
+        q_descale, k_descale, v_descale = normalized_descales
+        batch = cu_seqlens_q.numel() - 1
+        total, heads, dim = q.shape
+        kv_heads = k.shape[-2]
+        group = heads // kv_heads
+        paged = block_table is not None
+        page_size = k.shape[1] if paged else 0
+        # Bound packing by the physical cache size, including shared-page layouts.
+        logical_kv = (
+            paged
+            and max_seqlen_q >= 128
+            and max_seqlen_k > 0
+            and k.shape[0] > 0
+            and batch * max_seqlen_k <= k.shape[0] * page_size
         )
+        left, right = real_window_size
+        if out is None:
+            out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+        lse = (
+            torch.empty((heads, total), dtype=torch.float32, device=q.device)
+            if return_softmax_lse
+            else None
+        )
+        # Folding short queries reuses each KV tile across its grouped query heads.
+        fold = max_seqlen_q <= 16 and 1 < group <= 16 and group & (group - 1) == 0
+        block_m = 32 if fold and max_seqlen_q > 4 else 16
+        if max_seqlen_q >= 128:
+            block_m = 64
+        block_n = 128 if max_seqlen_k >= 512 else 64
+        num_warps = 4
+        if dim == 128 and logical_kv:
+            block_m, block_n, num_warps = 32, 64, 2
+        query_tile = block_m // group if fold else block_m
+        grid_heads = kv_heads if fold else heads
+        parallel_heads = batch * grid_heads
+        if left < 0 and right < 0 and max_seqlen_q <= 4 and max_seqlen_k >= 512:
+            splits = 4 if parallel_heads <= 128 else 2
+        elif left < 0 and right < 0 and 4 < max_seqlen_q <= 16 and max_seqlen_k >= 2048:
+            splits = 2
+        else:
+            splits = 1
+        split_kv = splits > 1
+        # The compact mapper reads CUQ on device, including empty and padded requests.
+        compact = max_seqlen_q > 16 and total * 2 < batch * max_seqlen_q
+        tiles = (
+            triton.cdiv(total, query_tile) + batch - 1
+            if compact
+            else triton.cdiv(max_seqlen_q, query_tile)
+        )
+        grid = (tiles * splits, 1 if compact else batch, grid_heads)
+        with torch_device_fn.device(q.device):
+            if logical_kv:
+                packed_shape = (batch, max_seqlen_k, kv_heads, dim)
+                packed_stride = (
+                    kv_heads * max_seqlen_k * dim,
+                    dim,
+                    max_seqlen_k * dim,
+                    1,
+                )
+                packed_key = torch.empty_strided(
+                    packed_shape, packed_stride, dtype=torch.int8, device=k.device
+                )
+                packed_value = torch.empty_strided(
+                    packed_shape, packed_stride, dtype=torch.float16, device=v.device
+                )
+                _flash_int8_pack_kv[
+                    (triton.cdiv(max_seqlen_k, PACK_TILE.value), batch, kv_heads)
+                ](
+                    k,
+                    v,
+                    packed_key,
+                    packed_value,
+                    block_table,
+                    seqused_k,
+                    cu_seqlens_q,
+                    max_seqlen_k,
+                    dim,
+                    kv_heads,
+                    page_size,
+                    block_table.stride(0),
+                    *k.stride()[:3],
+                    *v.stride()[:3],
+                    LOGICAL=True,
+                    SKIP_SHORT=False,
+                )
+                k, v = packed_key, packed_value
+            if split_kv:
+                kernel_out = torch.empty(
+                    (splits, total, heads, dim), dtype=torch.float32, device=q.device
+                )
+                kernel_stats = torch.empty(
+                    (splits, 2, heads, total), dtype=torch.float32, device=q.device
+                )
+            else:
+                kernel_out, kernel_stats = out, lse
+            paged_int8_fwd[grid](
+                q,
+                k,
+                v,
+                kernel_out,
+                kernel_stats,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_k,
+                block_table,
+                q_descale,
+                k_descale,
+                v_descale,
+                alibi_slopes,
+                q.stride(0),
+                q.stride(1),
+                k.stride(-3),
+                k.stride(-2),
+                k.stride(0) if paged else 0,
+                v.stride(-3),
+                v.stride(-2),
+                v.stride(0) if paged else 0,
+                kernel_out.stride(-3),
+                kernel_out.stride(-2),
+                *q_descale.stride(),
+                *k_descale.stride(),
+                *v_descale.stride(),
+                block_table.stride(0) if paged else 0,
+                (
+                    alibi_slopes.stride(0)
+                    if alibi_slopes is not None and alibi_slopes.ndim == 2
+                    else 0
+                ),
+                total,
+                group,
+                dim,
+                page_size,
+                paged,
+                causal,
+                left,
+                right,
+                softcap,
+                softmax_scale,
+                alibi_slopes is not None,
+                return_softmax_lse or split_kv,
+                KV_SPLITS=splits,
+                OUT_SPLIT_STRIDE=kernel_out.stride(0) if split_kv else 0,
+                LSE_SPLIT_STRIDE=kernel_stats.stride(0) if split_kv else 0,
+                LOGICAL_KV=logical_kv,
+                BATCH=batch,
+                COMPACT=compact,
+                FOLD=fold,
+                BM=block_m,
+                BN=block_n,
+                num_warps=num_warps,
+                num_stages=1,
+                pipeline="basic",
+            )
+            if split_kv:
+                _flash_int8_merge_splits[(total, heads)](
+                    kernel_out,
+                    kernel_stats,
+                    out,
+                    lse,
+                    cu_seqlens_q,
+                    total,
+                    heads,
+                    dim,
+                    batch,
+                    splits,
+                    out.stride(0),
+                    out.stride(1),
+                    return_softmax_lse,
+                    num_warps=1,
+                )
+        return (out, lse) if return_softmax_lse else out
     uniform_nonpaged = (
         head_size in (64, 128)
         and not (
