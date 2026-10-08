@@ -292,7 +292,7 @@ if _runtime.device.vendor_name == "thead":
 
 if _runtime.device.vendor_name == "metax":
 
-    def flash_attn_varlen_func_w8a8_int8(*args, **kwargs):
+    def flash_attn_varlen_func_w8a8_int8(*args, **kwargs):  # noqa: F811
         from flaggems_vllm.runtime.backend._metax.ops.flash_attention import (
             flash_attn_varlen_func_w8a8_int8 as _impl,
         )
