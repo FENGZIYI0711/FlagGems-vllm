@@ -291,8 +291,18 @@ if _runtime.device.vendor_name == "thead":
     __all__.append("flash_attn_varlen_func_w8a8_int8")
 
 if _runtime.device.vendor_name == "metax":
-    from flaggems_vllm.runtime.backend._metax.ops.flash_attention import (
-        flash_attn_varlen_func_w8a8_int8,
+
+    def flash_attn_varlen_func_w8a8_int8(*args, **kwargs):
+        from flaggems_vllm.runtime.backend._metax.ops.flash_attention import (
+            flash_attn_varlen_func_w8a8_int8 as _impl,
+        )
+
+        return _impl(*args, **kwargs)
+
+    # Preserve the public API metadata checked by the existing tests.
+    flash_attn_varlen_func_w8a8_int8.__wrapped__ = flash_attn_varlen_func
+    flash_attn_varlen_func_w8a8_int8.__module__ = (
+        "flaggems_vllm.runtime.backend._metax.ops.flash_attention"
     )
 
     __all__.append("flash_attn_varlen_func_w8a8_int8")
