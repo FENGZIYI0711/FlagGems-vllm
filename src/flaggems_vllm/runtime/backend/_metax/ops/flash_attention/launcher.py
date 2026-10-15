@@ -516,6 +516,11 @@ def flash_attn_varlen_func_w8a8_int8(
     num_warps = 4
     if dim > 128:
         block_m, block_n = 16, 64
+        if dim == 256 and paged and max_seqlen_q >= 128 and max_seqlen_k >= 2048:
+            # C550 long-query D256 benefits from reusing KV across 32 rows.
+            # Keep four warps: the D128 two-warp schedule spills excessively.
+            # Short KV contexts retain BM16 to avoid small-workload regressions.
+            block_m = 32
     if dim == 128 and logical_kv:
         block_m, block_n, num_warps = 32, 64, 2
     query_tile = block_m // group if fold else block_m
@@ -651,6 +656,8 @@ def flash_attn_varlen_func_w8a8_int8(
             num_warps=num_warps,
             num_stages=1,
             pipeline="basic",
+            # Restore the opt-in layout used by the published D128 benchmark.
+            scenario="attention-query-warps" if dim == 128 and logical_kv else "",
         )
         if split_kv:
             _flash_int8_merge_splits[(total, heads)](

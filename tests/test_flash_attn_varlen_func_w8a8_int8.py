@@ -880,7 +880,7 @@ def test_metax_gqa256_scheduling(heads, kvheads, num_splits, causal):
 def test_metax_gqa256_prefill(dtype, paged):
     _run_case(
         [129, 3],
-        [257, 19],
+        [2057, 19],
         dim=256,
         heads=4,
         kvheads=1,
@@ -890,6 +890,74 @@ def test_metax_gqa256_prefill(dtype, paged):
         strided=True,
         metax_kwargs=dict(num_splits=3),
     )
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX schedule")
+@pytest.mark.parametrize("heads,kvheads", [(4, 1), (16, 2)])
+@pytest.mark.parametrize("broadcast_scales", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_metax_gqa256_long_query_tiles(heads, kvheads, broadcast_scales, causal):
+    # Cross both the 32-row query tile and the 128-token scale boundaries.
+    # Include an empty request and a partial final KV tile in the same batch.
+    _run_case(
+        [31, 129, 0],
+        [137, 2057, 0],
+        dim=256,
+        heads=heads,
+        kvheads=kvheads,
+        paged=True,
+        page_size=32 if heads == 16 else 16,
+        causal=causal,
+        strided=True,
+        broadcast_scales=broadcast_scales,
+    )
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX schedule")
+@pytest.mark.parametrize("kv_length", [2047, 2048])
+def test_metax_gqa256_schedule_boundary(kv_length):
+    _run_case(
+        [33, 129],
+        [137, kv_length],
+        dim=256,
+        heads=4,
+        kvheads=1,
+        paged=True,
+        causal=True,
+    )
+
+
+@pytest.mark.parametrize("missing", [None, "cu_seqlens_q_value_2", "seqused_k_value_1"])
+def test_real_shape_reader_preserves_sequence_metadata(missing):
+    from tools.benchmark_metax_int8_real_shapes import read_captured_shape
+
+    fields = dict(
+        cu_seqlens_q_dim0=3,
+        cu_seqlens_q_value_count=3,
+        seqused_k_value_count=2,
+        cu_seqlens_q_value_0=0,
+        cu_seqlens_q_value_1=1,
+        cu_seqlens_q_value_2=133,
+        seqused_k_value_0=300,
+        seqused_k_value_1=201,
+        q_dim0=133,
+        max_seqlen_q=132,
+        max_seqlen_k=500,
+        k_dim0=40,
+        k_dim1=16,
+        block_table_dim1=32,
+    )
+    if missing:
+        fields.pop(missing)
+    entry = dict(labels=",".join(fields), shape=list(fields.values()))
+    if missing:
+        with pytest.raises(ValueError, match="Incomplete captured"):
+            read_captured_shape(entry)
+    else:
+        _, qlens, klens, pages = read_captured_shape(entry)
+        assert qlens == [1, 132]
+        assert klens == [300, 201]  # Neither request uses the max-K bound of 500.
+        assert pages == [19, 13]
 
 
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
@@ -962,7 +1030,7 @@ def test_metax_gqa256_split_score_modifiers(window, cap, with_alibi):
     alibi = torch.linspace(0.01, 0.04, 4, device="cuda") if with_alibi else None
     _run_case(
         [129, 3, 0],
-        [257, 129, 0],
+        [2057, 129, 0],
         dim=256,
         heads=4,
         kvheads=1,

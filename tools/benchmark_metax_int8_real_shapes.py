@@ -1,16 +1,15 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Replay captured dimensions with explicitly reconstructed missing contents.
+"""Replay captured shapes and complete per-request sequence lengths.
 
-The dump contains only CUQ[0:2] and USED[0]. Preserve these, total Q, all
-recorded maxima, full physical cache/table dimensions and scheduling arguments.
-Fill missing Q lengths from left to right, bounded by max_seqlen_q, leaving
-at least one token per remaining request when feasible. Fill missing K lengths
-with Q lengths, and extend the longest unknown request to max_seqlen_k. This
-is an upper-bound stress reconstruction, NOT recovery of the original tensors.
-Physical pages are assigned from a seeded random permutation of the full pool.
-INT8 data/scales are synthetic, and FA2 uses the same data dequantized to BF16.
-Both timed calls use the full recorded physical pools and the same page table.
+Read every recorded CUQ and USED value. max_seqlen_q/max_seqlen_k remain
+bounds; they must never replace a request's actual length. Incomplete sequence
+metadata is rejected instead of inventing a workload. Physical page mappings,
+INT8 values and FP32 descales are synthetic, because tensor contents were not
+captured. Both implementations use the full recorded physical pool and the
+same page table; FA2 receives the same INT8 values dequantized to BF16.
+This is an operator benchmark with exact captured sequence metadata, not an
+end-to-end model replay or a replay of original tensor values.
 
 Example (configure PYTHONPATH and an idle MetaX GPU externally):
   python tools/benchmark_metax_int8_real_shapes.py --shapes /path/shapes.json \
@@ -28,26 +27,23 @@ from collections import Counter
 from pathlib import Path
 
 
-def reconstruct(entry):
+def read_captured_shape(entry):
     d = dict(zip(entry["labels"].split(","), entry["shape"]))
     batch = d["cu_seqlens_q_dim0"] - 1
-    assert d["cu_seqlens_q_value_0"] == 0
-    qlens = [d["cu_seqlens_q_value_1"]]
-    remaining = d["q_dim0"] - qlens[0]
-    assert 0 <= qlens[0] <= d["max_seqlen_q"]
-    for i in range(1, batch):
-        others = batch - i - 1
-        reserve = min(remaining, others)
-        take = min(d["max_seqlen_q"], remaining - reserve)
-        qlens.append(take)
-        remaining -= take
-    assert remaining == 0 and sum(qlens) == d["q_dim0"]
-    klens = [d["seqused_k_value_0"], *qlens[1:]]
-    if batch > 1:
-        longest = max(range(1, batch), key=lambda i: qlens[i])
-        klens[longest] = d["max_seqlen_k"]
-    assert all(0 <= k <= d["max_seqlen_k"] for k in klens)
+    if (
+        d.get("cu_seqlens_q_value_count") != batch + 1
+        or d.get("seqused_k_value_count") != batch
+    ):
+        raise ValueError("Complete per-request CUQ and USED values are required")
+    try:
+        cuq = [d[f"cu_seqlens_q_value_{i}"] for i in range(batch + 1)]
+        klens = [d[f"seqused_k_value_{i}"] for i in range(batch)]
+    except KeyError as error:
+        raise ValueError("Incomplete captured sequence metadata") from error
+    qlens = [end - start for start, end in zip(cuq, cuq[1:])]
+    assert cuq[0] == 0 and cuq[-1] == d["q_dim0"]
     assert all(0 <= q <= d["max_seqlen_q"] for q in qlens)
+    assert all(0 <= k <= d["max_seqlen_k"] for k in klens)
     pages = [math.ceil(k / d["k_dim1"]) for k in klens]
     assert max(pages) <= d["block_table_dim1"]
     assert sum(pages) <= d["k_dim0"]
@@ -55,7 +51,7 @@ def reconstruct(entry):
 
 
 def build(entry, index, torch):
-    d, qlens, klens, pages = reconstruct(entry)
+    d, qlens, klens, pages = read_captured_shape(entry)
     torch.manual_seed(20261015 + index)
     dev = "cuda"
     batch, heads, kvheads = len(qlens), d["q_dim1"], d["k_dim2"]
@@ -185,7 +181,7 @@ def run(entry, index, args, torch, gems, fa2):
         recorded=d,
         qlens=c["qlens"],
         klens=c["klens"],
-        sequence_metadata_exact=len(c["qlens"]) == 1,
+        sequence_metadata_exact=True,
         active_pages=c["active_pages"],
         max_physical_page=c["max_page"],
         max_page_element_offset=c["max_page"] * c["qkv"][1].stride(0),
@@ -204,6 +200,16 @@ def run(entry, index, args, torch, gems, fa2):
         if round_id % 2:
             funcs.reverse()
         for name, fn in funcs:
+            if args.timing == "graph":
+                import triton.testing
+
+                samples[name].append(
+                    triton.testing.do_bench_cudagraph(
+                        fn, rep=args.graph_ms, return_mode="mean"
+                    )
+                    * 1000
+                )
+                continue
             start, end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
             start.record()
             for _ in range(args.repeat):
@@ -212,7 +218,8 @@ def run(entry, index, args, torch, gems, fa2):
             end.synchronize()
             samples[name].append(start.elapsed_time(end) * 1000 / args.repeat)
     row["samples_us"] = samples
-    row.update({key: statistics.median(value) for key, value in samples.items()})
+    aggregate = statistics.mean if args.timing == "graph" else statistics.median
+    row.update({key: aggregate(value) for key, value in samples.items()})
     row["speedup"] = row["fa2_us"] / row["int8_us"]
     return row
 
@@ -225,8 +232,13 @@ def main():
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--batches", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--timing", choices=("event", "graph"), default="event")
+    parser.add_argument("--graph-ms", type=int, default=100)
     args = parser.parse_args()
+    if min(args.repeat, args.batches, args.graph_ms) <= 0 or args.warmup < 0:
+        parser.error("repeat, batches and graph-ms must be positive; warmup >= 0")
     import torch
+    import triton
     from vllm_metax.v1.attention.backends.fa_utils import flash_attn_varlen_func as fa2
 
     import flaggems_vllm as gems
@@ -249,6 +261,8 @@ def main():
     )
     metadata = dict(
         torch=torch.__version__,
+        triton=triton.__version__,
+        triton_file=triton.__file__,
         gpu=torch.cuda.get_device_name(),
         source=gems.__file__,
         launcher_sha256=hashlib.sha256(
@@ -256,7 +270,12 @@ def main():
         ).hexdigest(),
         shapes_sha256=hashlib.sha256(args.shapes.read_bytes()).hexdigest(),
         reference_module=fa2.__module__,
-        timing="alternating CUDA Event batches, median",
+        timing=(
+            "alternating CUDA Graph measurements, mean"
+            if args.timing == "graph"
+            else "alternating CUDA Event batches, median"
+        ),
+        graph_ms=args.graph_ms if args.timing == "graph" else None,
         repeat=args.repeat,
         batches=args.batches,
         warmup=args.warmup,
