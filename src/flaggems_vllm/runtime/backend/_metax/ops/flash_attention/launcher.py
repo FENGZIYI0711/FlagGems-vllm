@@ -300,7 +300,11 @@ def flash_attn_varlen_func_w8a8_int8(
 ):
     """MetaX INT8 attention with FP32 softmax, for inference only.
 
-    Paged KV and GQA use FP16 PV and support head dimensions 64 and 128.
+    Paged KV and GQA use FP16 PV and support head dimensions 64, 128 and 256.
+    num_splits is an upper bound (0 selects the existing automatic policy, 1
+    disables splitting). Split workspaces are bounded to 256 MiB. Optional
+    scheduler_metadata is a foreign scheduling hint: MetaX rebuilds its schedule
+    from the sequence metadata and does not consume or mutate this tensor.
     Descales index logical 128-token blocks, independently of physical cache pages. The
     output defaults to BF16 or uses a supplied FP16/BF16 buffer. Forward
     inference only; unsupported training and scheduling modes raise errors.
@@ -311,8 +315,17 @@ def flash_attn_varlen_func_w8a8_int8(
         raise NotImplementedError("return_attn_probs is not supported")
     if q_v is not None:
         raise NotImplementedError("q_v is not supported")
-    if scheduler_metadata is not None or s_aux is not None:
-        raise NotImplementedError("scheduler arguments are not supported")
+    if s_aux is not None:
+        raise NotImplementedError("s_aux is not supported")
+    if scheduler_metadata is not None and (
+        scheduler_metadata.device != q.device
+        or scheduler_metadata.dtype != torch.int32
+        or scheduler_metadata.ndim != 1
+        or not scheduler_metadata.is_contiguous()
+    ):
+        raise ValueError(
+            "scheduler_metadata must be a contiguous int32 vector on q.device"
+        )
     if cp_world_size != 1 or cp_rank != 0 or cp_tot_seqused_k is not None:
         raise NotImplementedError("context parallel attention is not supported")
     if runtime.device.vendor_name != "metax":
@@ -321,8 +334,10 @@ def flash_attn_varlen_func_w8a8_int8(
         )
     if fa_version != 2:
         raise NotImplementedError("Only FA2 is implemented.")
-    if num_splits != 0:
-        raise NotImplementedError("Explicit num_splits is not implemented.")
+    if isinstance(num_splits, bool) or not isinstance(num_splits, int):
+        raise TypeError("num_splits must be an integer in [0, 32]")
+    if not 0 <= num_splits <= 32:
+        raise ValueError("num_splits must be in [0, 32]")
     assert (
         cu_seqlens_k is not None or seqused_k is not None
     ), "cu_seqlens_k or seqused_k must be provided"
@@ -390,8 +405,8 @@ def flash_attn_varlen_func_w8a8_int8(
     num_heads_k = k.shape[2] if block_table is not None else k.shape[1]
     if num_heads_k <= 0 or q.shape[1] <= 0 or q.shape[1] % num_heads_k != 0:
         raise ValueError("The number of KV heads must divide the number of query heads")
-    if q.shape[1] != num_heads_k and head_size not in (64, 128):
-        raise NotImplementedError("GQA supports head dimensions 64 and 128")
+    if q.shape[1] != num_heads_k and head_size not in (64, 128, 256):
+        raise NotImplementedError("GQA supports head dimensions 64, 128 and 256")
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -514,6 +529,16 @@ def flash_attn_varlen_func_w8a8_int8(
         splits = 1
     if dim not in (64, 128):
         splits = 1
+    if num_splits:
+        if num_splits > 1 and dim not in (64, 128, 256):
+            raise NotImplementedError(
+                "Split-KV supports head dimensions 64, 128 and 256"
+            )
+        bytes_per_split = total * heads * (dim + 2) * 4
+        workspace_cap = max(1, (256 * 1024 * 1024) // max(bytes_per_split, 1))
+        splits = min(
+            num_splits, max(1, triton.cdiv(max_seqlen_k, block_n)), workspace_cap
+        )
     split_kv = splits > 1
     # The compact mapper reads CUQ on device, including empty and padded requests.
     compact = max_seqlen_q > 16 and total * 2 < batch * max_seqlen_q

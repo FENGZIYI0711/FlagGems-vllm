@@ -707,6 +707,9 @@ def flash_varlen_int8_fwd_kernel(
                         )
                     else:
                         page = tl.load(TABLE + batch * table_stride + n // PAGE)
+                    # Physical cache pools can exceed 2**31 elements. Widen
+                    # before multiplying; casting an overflowed offset is too late.
+                    page = page.to(tl.int64)
                     k_row = page * pk + n % PAGE * sk
                     v_row = page * pv + n % PAGE * sv
                 else:
