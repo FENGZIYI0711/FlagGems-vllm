@@ -94,6 +94,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "tests/test_fp8_einsum.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/w8a8_block_int8_bmm.py": [
+        "tests/test_int8_einsum.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_hygon/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
@@ -106,6 +109,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
     ],
     "src/flaggems_vllm/runtime/backend/_thead/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/w8a8_block_int8_bmm.py": [
+        "tests/test_int8_einsum.py",
     ],
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
     "src/flaggems_vllm/ops/flashmla_sparse.py": ["tests/test_flash_mla_sparse_fwd.py"],
@@ -162,6 +168,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
         "benchmark/test_fp8_einsum.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/w8a8_block_int8_bmm.py": [
+        "benchmark/test_int8_einsum.py",
+    ],
     "src/flaggems_vllm/ops/attention.py": [
         "benchmark/test_flash_attn_varlen_func.py",
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
@@ -174,6 +183,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/runtime/backend/_thead/fused/attention.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/w8a8_block_int8_bmm.py": [
+        "benchmark/test_int8_einsum.py",
     ],
     "src/flaggems_vllm/ops/rotary_embedding.py": [
         "benchmark/test_apply_rotary_pos_emb.py"
