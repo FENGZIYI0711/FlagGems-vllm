@@ -879,7 +879,7 @@ def test_metax_gqa256_scheduling(heads, kvheads, num_splits, causal):
 @pytest.mark.parametrize("paged", [False, True])
 def test_metax_gqa256_prefill(dtype, paged):
     _run_case(
-        [129, 3],
+        [1025, 3],
         [2057, 19],
         dim=256,
         heads=4,
@@ -897,10 +897,10 @@ def test_metax_gqa256_prefill(dtype, paged):
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 def test_metax_gqa256_long_query_tiles(heads, kvheads, broadcast_scales, causal):
-    # Cross both the 32-row query tile and the 128-token scale boundaries.
+    # Cross both the 64-row query tile and the 128-token scale boundaries.
     # Include an empty request and a partial final KV tile in the same batch.
     _run_case(
-        [31, 129, 0],
+        [31, 1025, 0],
         [137, 2057, 0],
         dim=256,
         heads=heads,
@@ -915,7 +915,8 @@ def test_metax_gqa256_long_query_tiles(heads, kvheads, broadcast_scales, causal)
 
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX schedule")
 @pytest.mark.parametrize("kv_length", [2047, 2048])
-def test_metax_gqa256_schedule_boundary(kv_length):
+@pytest.mark.parametrize("query_bound", [1023, 1024])
+def test_metax_gqa256_schedule_boundary(kv_length, query_bound):
     _run_case(
         [33, 129],
         [137, kv_length],
@@ -924,6 +925,7 @@ def test_metax_gqa256_schedule_boundary(kv_length):
         kvheads=1,
         paged=True,
         causal=True,
+        max_query_bound=query_bound,
     )
 
 
@@ -1029,7 +1031,7 @@ def test_metax_int8_large_physical_page_offset(dim, kvheads, qlen):
 def test_metax_gqa256_split_score_modifiers(window, cap, with_alibi):
     alibi = torch.linspace(0.01, 0.04, 4, device="cuda") if with_alibi else None
     _run_case(
-        [129, 3, 0],
+        [1025, 3, 0],
         [2057, 129, 0],
         dim=256,
         heads=4,

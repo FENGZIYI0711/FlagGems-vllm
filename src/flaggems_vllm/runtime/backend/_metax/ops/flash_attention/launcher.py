@@ -490,10 +490,19 @@ def flash_attn_varlen_func_w8a8_int8(
     group = heads // kv_heads
     paged = block_table is not None
     page_size = k.shape[1] if paged else 0
+    # Amortize D256 packing over long queries and bound the INT8 K + FP16 V
+    # scratch allocation, even when max_seqlen_k is a padded upper bound.
+    pack_d256 = (
+        dim == 256
+        and batch <= 16
+        and max_seqlen_q >= 1024
+        and max_seqlen_k >= 2048
+        and batch * max_seqlen_k * kv_heads * dim * 3 <= 512 * 1024 * 1024
+    )
     # Bound packing by the physical cache size, including shared-page layouts.
     logical_kv = (
         paged
-        and dim in (64, 128)
+        and (dim in (64, 128) or pack_d256)
         and max_seqlen_q >= 128
         and max_seqlen_k > 0
         and k.shape[0] > 0
@@ -523,6 +532,10 @@ def flash_attn_varlen_func_w8a8_int8(
             block_m = 32
     if dim == 128 and logical_kv:
         block_m, block_n, num_warps = 32, 64, 2
+    if dim == 256 and logical_kv:
+        # Packing makes a wider query tile profitable on C550. Two stages
+        # overlap loads while reusing each KV tile across 64 query rows.
+        block_m = 64
     query_tile = block_m // group if fold else block_m
     grid_heads = kv_heads if fold else heads
     parallel_heads = batch * grid_heads
@@ -546,7 +559,14 @@ def flash_attn_varlen_func_w8a8_int8(
         )
     split_kv = splits > 1
     # The compact mapper reads CUQ on device, including empty and padded requests.
-    compact = max_seqlen_q > 16 and total * 2 < batch * max_seqlen_q
+    # The compact mapper's live state makes the wide packed D256 kernel spill
+    # heavily. Use a rectangular grid for this small-batch path; pack_d256's
+    # batch bound limits the extra inactive query tiles.
+    compact = (
+        max_seqlen_q > 16
+        and total * 2 < batch * max_seqlen_q
+        and not (dim == 256 and logical_kv)
+    )
     tiles = (
         triton.cdiv(total, query_tile) + batch - 1
         if compact
@@ -654,7 +674,7 @@ def flash_attn_varlen_func_w8a8_int8(
             BM=block_m,
             BN=block_n,
             num_warps=num_warps,
-            num_stages=1,
+            num_stages=2 if dim == 256 and logical_kv else 1,
             pipeline="basic",
             # Restore the opt-in layout used by the published D128 benchmark.
             scenario="attention-query-warps" if dim == 128 and logical_kv else "",
