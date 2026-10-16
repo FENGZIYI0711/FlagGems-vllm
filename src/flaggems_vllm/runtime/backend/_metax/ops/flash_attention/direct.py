@@ -631,6 +631,7 @@ def flash_varlen_int8_fwd_kernel(
     FOLD: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
+    DECODE_FASTPATH: tl.constexpr = False,
 ):
     program_tile = tl.program_id(0)
     (tile, batch, head) = (
@@ -656,163 +657,249 @@ def flash_varlen_int8_fwd_kernel(
     m = rows // GROUP if FOLD else rows
     h = kv_head * GROUP + rows % GROUP if FOLD else tl.full((BM,), head, tl.int32)
     d = tl.arange(0, D)
-    if active & (tile * query_tile < nq):
-        q = tl.load(
-            Q + (q_start + m[:, None]) * sq + h[:, None] * hq + d[None, :],
-            (m[:, None] < nq) & (d[None, :] < HEAD_DIM),
-            0,
-        )
-        q_scale = tl.load(QS + batch * qs0 + h * qs1 + m // 128 * qs2, m < nq, 0)
-        if not COMPACT and CAP <= 0 and (not HAS_ALIBI):
-            q_scale = q_scale * (SCALE * 1.4426950408889634)
-        maximum = tl.full((BM,), float("-inf"), tl.float32)
-        denom = tl.full((BM,), 0, tl.float32)
-        acc = tl.full((BM, D), 0, tl.float32)
-        if HAS_ALIBI:
-            slope = tl.load(ALIBI + batch * alibi_stride + h)
-        first = 0
-        end = nk
-        if LEFT >= 0:
-            first = tl.maximum(0, tile * query_tile + nk - nq - LEFT) // BN
-        if CAUSAL:
-            end = tl.minimum(end, (tile + 1) * query_tile + nk - nq)
-        if RIGHT >= 0:
-            end = tl.minimum(end, (tile + 1) * query_tile + nk - nq + RIGHT)
-        use_dense: tl.constexpr = LEFT < 0 and RIGHT < 0
-        end_block = tl.cdiv(tl.maximum(end, 0), BN)
-        if use_dense:
-            full_keys = nk
-            if CAUSAL:
-                full_keys = tl.minimum(nk, tile * query_tile + nk - nq + 1)
-            full_hi = tl.maximum(full_keys, 0) // BN
-        for mask_phase in tl.static_range(2 if use_dense else 1):
-            if use_dense:
-                begin_block = first if mask_phase == 0 else full_hi
-                stop_block = full_hi if mask_phase == 0 else end_block
+    # One query attending to one key has unit softmax weight. Read actual
+    # lengths on device: max_seqlen_k may be a padded capacity bound.
+    single_key = tl.full((), False, tl.int1)
+    if DECODE_FASTPATH and HEAD_DIM == 256 and FOLD:
+        single_key = (nq == 1) & (nk == 1)
+    empty_split = tl.full((), False, tl.int1)
+    if DECODE_FASTPATH and HEAD_DIM == 256 and FOLD and KV_SPLITS > 1:
+        blocks = tl.cdiv(nk, BN)
+        empty_split = split_id * tl.cdiv(blocks, KV_SPLITS) >= blocks
+    if empty_split:
+        # Explicit split hints can greatly exceed the actual key tile count.
+        # Initialize empty partials without loading Q/K/V or running dot products.
+        if active & (tile * query_tile < nq):
+            tl.store(
+                O
+                + split_id * OUT_SPLIT_STRIDE
+                + (q_start + m[:, None]) * so
+                + h[:, None] * ho
+                + d[None, :],
+                0.0,
+                (m[:, None] < nq) & (d[None, :] < HEAD_DIM),
+            )
+            if WRITE_LSE:
+                address = LSE + split_id * LSE_SPLIT_STRIDE + h * TOTAL_Q + q_start + m
+                tl.store(address, float("-inf"), m < nq)
+                tl.store(address + LSE_SPLIT_STRIDE // 2, 0.0, m < nq)
+    elif single_key:
+        if active & (tile == 0):
+            if PAGED:
+                page = tl.load(TABLE + batch * table_stride).to(tl.int64)
+                v_row = page * pv
             else:
-                (begin_block, stop_block) = (first, end_block)
-            if KV_SPLITS > 1:
-                blocks_per_split = tl.cdiv(tl.cdiv(nk, BN), KV_SPLITS)
-                begin_block = tl.maximum(begin_block, split_id * blocks_per_split)
-                stop_block = tl.minimum(stop_block, (split_id + 1) * blocks_per_split)
-            for start in range(begin_block, stop_block):
-                n = start * BN + tl.arange(0, BN)
-                if LOGICAL_KV:
-                    k_row = batch * pk + n * sk
-                    v_row = batch * pv + n * sv
-                elif PAGED:
+                v_row = k_start * sv
+            value = tl.load(V + v_row + kv_head * hv + d, d < HEAD_DIM, 0)
+            v_scale = tl.load(VS + batch * vs0 + kv_head * vs1)
+            result = value.to(tl.float32) * v_scale
+            result = tl.where(split_id == 0, result, 0.0)
+            if WRITE_LSE:
+                if PAGED:
+                    k_row = page * pk
+                else:
+                    k_row = k_start * sk
+                key = tl.load(K + k_row + kv_head * hk + d, d < HEAD_DIM, 0)
+                query = tl.load(
+                    Q + q_start * sq + h[:, None] * hq + d[None, :],
+                    (rows[:, None] < GROUP) & (d[None, :] < HEAD_DIM),
+                    0,
+                )
+                qs = tl.load(QS + batch * qs0 + h * qs1, rows < GROUP, 0)
+                ks = tl.load(KS + batch * ks0 + kv_head * ks1)
+                score = tl.sum(query.to(tl.int32) * key[None, :].to(tl.int32), 1).to(
+                    tl.float32
+                )
+                score = score * (qs * ks * SCALE)
+                if CAP > 0:
+                    score = CAP * (2 / (1 + tl.exp(2 * (-score / CAP))) - 1)
+                address = LSE + split_id * LSE_SPLIT_STRIDE + h * TOTAL_Q + q_start
+                if KV_SPLITS > 1:
+                    tl.store(
+                        address,
+                        tl.where(
+                            split_id == 0, score * 1.4426950408889634, float("-inf")
+                        ),
+                        rows < GROUP,
+                    )
+                    tl.store(
+                        address + LSE_SPLIT_STRIDE // 2,
+                        tl.where(split_id == 0, 1.0, 0.0),
+                        rows < GROUP,
+                    )
+                else:
+                    tl.store(address, score, rows < GROUP)
+            tl.store(
+                O
+                + split_id * OUT_SPLIT_STRIDE
+                + q_start * so
+                + h[:, None] * ho
+                + d[None, :],
+                tl.broadcast_to(result[None, :], (BM, D)),
+                (rows[:, None] < GROUP) & (d[None, :] < HEAD_DIM),
+            )
+    else:
+        if active & (tile * query_tile < nq):
+            q = tl.load(
+                Q + (q_start + m[:, None]) * sq + h[:, None] * hq + d[None, :],
+                (m[:, None] < nq) & (d[None, :] < HEAD_DIM),
+                0,
+            )
+            q_scale = tl.load(QS + batch * qs0 + h * qs1 + m // 128 * qs2, m < nq, 0)
+            if not COMPACT and CAP <= 0 and (not HAS_ALIBI):
+                q_scale = q_scale * (SCALE * 1.4426950408889634)
+            maximum = tl.full((BM,), float("-inf"), tl.float32)
+            denom = tl.full((BM,), 0, tl.float32)
+            acc = tl.full((BM, D), 0, tl.float32)
+            if HAS_ALIBI:
+                slope = tl.load(ALIBI + batch * alibi_stride + h)
+            first = 0
+            end = nk
+            if LEFT >= 0:
+                first = tl.maximum(0, tile * query_tile + nk - nq - LEFT) // BN
+            if CAUSAL:
+                end = tl.minimum(end, (tile + 1) * query_tile + nk - nq)
+            if RIGHT >= 0:
+                end = tl.minimum(end, (tile + 1) * query_tile + nk - nq + RIGHT)
+            use_dense: tl.constexpr = LEFT < 0 and RIGHT < 0
+            end_block = tl.cdiv(tl.maximum(end, 0), BN)
+            if use_dense:
+                full_keys = nk
+                if CAUSAL:
+                    full_keys = tl.minimum(nk, tile * query_tile + nk - nq + 1)
+                full_hi = tl.maximum(full_keys, 0) // BN
+            for mask_phase in tl.static_range(2 if use_dense else 1):
+                if use_dense:
+                    begin_block = first if mask_phase == 0 else full_hi
+                    stop_block = full_hi if mask_phase == 0 else end_block
+                else:
+                    (begin_block, stop_block) = (first, end_block)
+                if KV_SPLITS > 1:
+                    blocks_per_split = tl.cdiv(tl.cdiv(nk, BN), KV_SPLITS)
+                    begin_block = tl.maximum(begin_block, split_id * blocks_per_split)
+                    stop_block = tl.minimum(
+                        stop_block, (split_id + 1) * blocks_per_split
+                    )
+                for start in range(begin_block, stop_block):
+                    n = start * BN + tl.arange(0, BN)
+                    if LOGICAL_KV:
+                        k_row = batch * pk + n * sk
+                        v_row = batch * pv + n * sv
+                    elif PAGED:
+                        if not use_dense or mask_phase == 1:
+                            page = tl.load(
+                                TABLE + batch * table_stride + n // PAGE, n < nk, 0
+                            )
+                        else:
+                            page = tl.load(TABLE + batch * table_stride + n // PAGE)
+                        # Physical cache pools can exceed 2**31 elements. Widen
+                        # before multiplying; casting an overflowed offset is too late.
+                        page = page.to(tl.int64)
+                        k_row = page * pk + n % PAGE * sk
+                        v_row = page * pv + n % PAGE * sv
+                    else:
+                        k_row = (k_start + n) * sk
+                        v_row = (k_start + n) * sv
                     if not use_dense or mask_phase == 1:
-                        page = tl.load(
-                            TABLE + batch * table_stride + n // PAGE, n < nk, 0
+                        k = tl.load(
+                            K + k_row[None, :] + kv_head * hk + d[:, None],
+                            (n[None, :] < nk) & (d[:, None] < HEAD_DIM),
+                            0,
                         )
                     else:
-                        page = tl.load(TABLE + batch * table_stride + n // PAGE)
-                    # Physical cache pools can exceed 2**31 elements. Widen
-                    # before multiplying; casting an overflowed offset is too late.
-                    page = page.to(tl.int64)
-                    k_row = page * pk + n % PAGE * sk
-                    v_row = page * pv + n % PAGE * sv
-                else:
-                    k_row = (k_start + n) * sk
-                    v_row = (k_start + n) * sv
-                if not use_dense or mask_phase == 1:
-                    k = tl.load(
-                        K + k_row[None, :] + kv_head * hk + d[:, None],
-                        (n[None, :] < nk) & (d[:, None] < HEAD_DIM),
-                        0,
-                    )
-                else:
-                    k = tl.load(
-                        K + k_row[None, :] + kv_head * hk + d[:, None],
-                        d[:, None] < HEAD_DIM,
-                        0,
-                    )
-                descale_block = start * BN // 128
-                ks = tl.load(KS + batch * ks0 + kv_head * ks1 + descale_block * ks2)
-                vs = tl.load(VS + batch * vs0 + kv_head * vs1 + descale_block * vs2)
-                scores = tl.trans(
-                    tl.dot(tl.trans(k), tl.trans(q), out_dtype=tl.int32)
-                ).to(tl.float32)
-                if not COMPACT and CAP <= 0 and (not HAS_ALIBI):
-                    scores = scores * (q_scale * ks)[:, None]
-                else:
-                    scores = scores * (q_scale * ks * SCALE)[:, None]
-                if CAP > 0:
-                    scores = CAP * (2 / (1 + tl.exp(2 * (-scores / CAP))) - 1)
-                position = m + nk - nq
-                if HAS_ALIBI:
-                    scores -= slope[:, None] * tl.abs(position[:, None] - n[None, :])
-                if not use_dense or mask_phase == 1:
-                    valid = n[None, :] < nk
-                    if CAUSAL:
-                        valid &= n[None, :] <= position[:, None]
-                    if LEFT >= 0:
-                        valid &= n[None, :] >= position[:, None] - LEFT
-                    if RIGHT >= 0:
-                        valid &= n[None, :] <= position[:, None] + RIGHT
-                if not (not COMPACT and CAP <= 0 and (not HAS_ALIBI)):
-                    scores = scores * 1.4426950408889634
-                if not use_dense or mask_phase == 1:
-                    scores = tl.where(valid, scores, float("-inf"))
-                alpha, probabilities, maximum, denom = online_softmax_stats(
-                    scores, maximum, denom, 1.0, IS_BORDER=True
-                )
-                if not use_dense or mask_phase == 1:
-                    v = tl.load(
-                        V + v_row[:, None] + kv_head * hv + d[None, :],
-                        (n[:, None] < nk) & (d[None, :] < HEAD_DIM),
-                        0,
-                    )
-                else:
-                    v = tl.load(
-                        V + v_row[:, None] + kv_head * hv + d[None, :],
-                        d[None, :] < HEAD_DIM,
-                        0,
-                    )
-                if vs2 == 0:
-                    acc = tl.trans(
-                        tl.dot(
-                            tl.trans(v.to(tl.float16)),
-                            tl.trans(probabilities.to(tl.float16)),
-                            tl.trans(acc * alpha[:, None]),
+                        k = tl.load(
+                            K + k_row[None, :] + kv_head * hk + d[:, None],
+                            d[:, None] < HEAD_DIM,
+                            0,
                         )
-                    )
-                else:
-                    partial = tl.trans(
-                        tl.dot(
-                            tl.trans(v.to(tl.float16)),
-                            tl.trans(probabilities.to(tl.float16)),
-                            out_dtype=tl.float32,
+                    descale_block = start * BN // 128
+                    ks = tl.load(KS + batch * ks0 + kv_head * ks1 + descale_block * ks2)
+                    vs = tl.load(VS + batch * vs0 + kv_head * vs1 + descale_block * vs2)
+                    scores = tl.trans(
+                        tl.dot(tl.trans(k), tl.trans(q), out_dtype=tl.int32)
+                    ).to(tl.float32)
+                    if not COMPACT and CAP <= 0 and (not HAS_ALIBI):
+                        scores = scores * (q_scale * ks)[:, None]
+                    else:
+                        scores = scores * (q_scale * ks * SCALE)[:, None]
+                    if CAP > 0:
+                        scores = CAP * (2 / (1 + tl.exp(2 * (-scores / CAP))) - 1)
+                    position = m + nk - nq
+                    if HAS_ALIBI:
+                        scores -= slope[:, None] * tl.abs(
+                            position[:, None] - n[None, :]
                         )
+                    if not use_dense or mask_phase == 1:
+                        valid = n[None, :] < nk
+                        if CAUSAL:
+                            valid &= n[None, :] <= position[:, None]
+                        if LEFT >= 0:
+                            valid &= n[None, :] >= position[:, None] - LEFT
+                        if RIGHT >= 0:
+                            valid &= n[None, :] <= position[:, None] + RIGHT
+                    if not (not COMPACT and CAP <= 0 and (not HAS_ALIBI)):
+                        scores = scores * 1.4426950408889634
+                    if not use_dense or mask_phase == 1:
+                        scores = tl.where(valid, scores, float("-inf"))
+                    alpha, probabilities, maximum, denom = online_softmax_stats(
+                        scores, maximum, denom, 1.0, IS_BORDER=True
                     )
-                    acc = acc * alpha[:, None] + partial * vs
-        if KV_SPLITS > 1:
-            result = acc
-        else:
-            result = acc / tl.where(denom > 0, denom, 1)[:, None]
-        if vs2 == 0:
-            v_scale = tl.load(VS + batch * vs0 + kv_head * vs1, nk > 0, 0)
-            result *= v_scale
-        tl.store(
-            O
-            + split_id * OUT_SPLIT_STRIDE
-            + (q_start + m[:, None]) * so
-            + h[:, None] * ho
-            + d[None, :],
-            result,
-            (m[:, None] < nq) & (d[None, :] < HEAD_DIM),
-        )
-        if WRITE_LSE:
+                    if not use_dense or mask_phase == 1:
+                        v = tl.load(
+                            V + v_row[:, None] + kv_head * hv + d[None, :],
+                            (n[:, None] < nk) & (d[None, :] < HEAD_DIM),
+                            0,
+                        )
+                    else:
+                        v = tl.load(
+                            V + v_row[:, None] + kv_head * hv + d[None, :],
+                            d[None, :] < HEAD_DIM,
+                            0,
+                        )
+                    if vs2 == 0:
+                        acc = tl.trans(
+                            tl.dot(
+                                tl.trans(v.to(tl.float16)),
+                                tl.trans(probabilities.to(tl.float16)),
+                                tl.trans(acc * alpha[:, None]),
+                            )
+                        )
+                    else:
+                        partial = tl.trans(
+                            tl.dot(
+                                tl.trans(v.to(tl.float16)),
+                                tl.trans(probabilities.to(tl.float16)),
+                                out_dtype=tl.float32,
+                            )
+                        )
+                        acc = acc * alpha[:, None] + partial * vs
             if KV_SPLITS > 1:
-                lse_address = (
-                    LSE + split_id * LSE_SPLIT_STRIDE + h * TOTAL_Q + q_start + m
-                )
-                tl.store(lse_address, maximum, m < nq)
-                tl.store(lse_address + LSE_SPLIT_STRIDE // 2, denom, m < nq)
+                result = acc
             else:
-                lse = tl.where(
-                    denom > 0,
-                    maximum * 0.6931471805599453 + tl.log(denom),
-                    float("inf"),
-                )
-                tl.store(LSE + h * TOTAL_Q + q_start + m, lse, m < nq)
+                result = acc / tl.where(denom > 0, denom, 1)[:, None]
+            if vs2 == 0:
+                v_scale = tl.load(VS + batch * vs0 + kv_head * vs1, nk > 0, 0)
+                result *= v_scale
+            tl.store(
+                O
+                + split_id * OUT_SPLIT_STRIDE
+                + (q_start + m[:, None]) * so
+                + h[:, None] * ho
+                + d[None, :],
+                result,
+                (m[:, None] < nq) & (d[None, :] < HEAD_DIM),
+            )
+            if WRITE_LSE:
+                if KV_SPLITS > 1:
+                    lse_address = (
+                        LSE + split_id * LSE_SPLIT_STRIDE + h * TOTAL_Q + q_start + m
+                    )
+                    tl.store(lse_address, maximum, m < nq)
+                    tl.store(lse_address + LSE_SPLIT_STRIDE // 2, denom, m < nq)
+                else:
+                    lse = tl.where(
+                        denom > 0,
+                        maximum * 0.6931471805599453 + tl.log(denom),
+                        float("inf"),
+                    )
+                    tl.store(LSE + h * TOTAL_Q + q_start + m, lse, m < nq)

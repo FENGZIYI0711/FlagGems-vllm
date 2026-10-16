@@ -494,7 +494,8 @@ def flash_attn_varlen_func_w8a8_int8(
     # scratch allocation, even when max_seqlen_k is a padded upper bound.
     pack_d256 = (
         dim == 256
-        and batch <= 16
+        and batch <= 64
+        and (batch <= 16 or batch * max_seqlen_q <= 32 * total)
         and max_seqlen_q >= 1024
         and max_seqlen_k >= 2048
         and batch * max_seqlen_k * kv_heads * dim * 3 <= 512 * 1024 * 1024
@@ -560,8 +561,8 @@ def flash_attn_varlen_func_w8a8_int8(
     split_kv = splits > 1
     # The compact mapper reads CUQ on device, including empty and padded requests.
     # The compact mapper's live state makes the wide packed D256 kernel spill
-    # heavily. Use a rectangular grid for this small-batch path; pack_d256's
-    # batch bound limits the extra inactive query tiles.
+    # heavily. Use a rectangular grid; pack_d256 bounds both batch size
+    # and padding overhead for larger batches.
     compact = (
         max_seqlen_q > 16
         and total * 2 < batch * max_seqlen_q
@@ -671,6 +672,13 @@ def flash_attn_varlen_func_w8a8_int8(
             BATCH=batch,
             COMPACT=compact,
             FOLD=fold,
+            # Keep the original schedule for short dense KV and multi-query
+            # tiles; the extra runtime branches can increase register pressure.
+            DECODE_FASTPATH=(
+                dim == 256
+                and max_seqlen_q == 1
+                and (max_seqlen_k == 1 or max_seqlen_k > block_n)
+            ),
             BM=block_m,
             BN=block_n,
             num_warps=num_warps,

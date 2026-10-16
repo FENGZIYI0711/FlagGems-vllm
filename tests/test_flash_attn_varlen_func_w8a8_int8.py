@@ -116,8 +116,10 @@ def _run_case(
     broadcast_scales=False,
     extra_cache_pages=0,
     max_query_bound=None,
+    max_key_bound=None,
     metax_kwargs=None,
     page_size=16,
+    return_lse=True,
 ):
     q, qs, qr, cuq = _inputs(qlens, heads, dim, broadcast_scales)
     k, ks, kr, cuk = _inputs(klens, kvheads, dim, broadcast_scales)
@@ -180,29 +182,31 @@ def _run_case(
         qs, ks, vs = [
             x.transpose(1, 2).contiguous().transpose(1, 2) for x in (qs, ks, vs)
         ]
-    result, lse = flaggems_vllm.flash_attn_varlen_func(
+    actual = flaggems_vllm.flash_attn_varlen_func(
         q,
         k,
         v,
         max(qlens) if max_query_bound is None else max_query_bound,
         cuq,
-        max(klens),
+        max(klens) if max_key_bound is None else max_key_bound,
         **kwargs,
         q_descale=qs,
         k_descale=ks,
         v_descale=vs,
         causal=causal,
-        return_softmax_lse=True,
+        return_softmax_lse=return_lse,
         out=out,
         window_size=window,
         softcap=cap,
         alibi_slopes=alibi,
         **(metax_kwargs or {}),
     )
+    result, lse = actual if return_lse else (actual, None)
     ref, ref_lse = _reference(qr, kr, vr, qlens, klens, causal, window, cap, alibi)
     assert result is out
     torch.testing.assert_close(result.float(), ref, atol=0.025, rtol=0.025)
-    torch.testing.assert_close(lse, ref_lse, atol=2e-5, rtol=2e-5)
+    if return_lse:
+        torch.testing.assert_close(lse, ref_lse, atol=2e-5, rtol=2e-5)
     return qr, kr, vr, cuq, cuk, result
 
 
@@ -1060,3 +1064,49 @@ def test_metax_invalid_scheduler_metadata(kind):
         flaggems_vllm.flash_attn_varlen_func(
             q, q, q, 1, cu, 1, cu, scheduler_metadata=metadata
         )
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX dispatch")
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("heads,kvheads", [(4, 1), (16, 2)])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("splits", [1, 32])
+def test_metax_d256_single_key_mixed_lengths(
+    paged, dtype, heads, kvheads, return_lse, splits
+):
+    # Exercise unit-weight requests beside empty and general attention requests.
+    # Padded KV capacity and explicit splits exercise empty partials.
+    _run_case(
+        [1, 1, 0, 1, 1],
+        [1, 32, 0, 0, 1],
+        dim=256,
+        heads=heads,
+        kvheads=kvheads,
+        paged=paged,
+        dtype=dtype,
+        strided=True,
+        causal=True,
+        window=(0, 0),
+        cap=3.0,
+        max_query_bound=1,
+        max_key_bound=73728,
+        return_lse=return_lse,
+        metax_kwargs={"num_splits": splits},
+    )
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX dispatch")
+@pytest.mark.parametrize("batch", [17, 64])
+def test_metax_d256_large_batch_packing(batch):
+    _run_case(
+        [1025] * 4 + [1] * (batch - 5) + [0],
+        [2057] * 4 + [1] * (batch - 5) + [0],
+        dim=256,
+        heads=4,
+        kvheads=1,
+        paged=True,
+        causal=True,
+        broadcast_scales=False,
+        strided=True,
+    )
