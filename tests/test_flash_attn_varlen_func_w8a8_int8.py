@@ -25,7 +25,7 @@ DESCALE_BLOCK = 128
 torch.backends.cuda.matmul.allow_tf32 = False
 
 pytestmark = [
-    pytest.mark.flash_attn_varlen_func_w8a8_int8,
+    pytest.mark.flash_attn_varlen_func_w8a8,
     pytest.mark.skipif(
         flaggems_vllm.vendor_name not in ("hygon", "thead", "metax"),
         reason="INT8 attention backend unavailable",
