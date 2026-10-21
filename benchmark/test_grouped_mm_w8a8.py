@@ -14,12 +14,15 @@
 
 """Standard grouped_mm_w8a8 benchmark with explicit baseline provenance.
 
-Datasets live outside the repository. Convert a captured operator directory with
- tools/prepare_grouped_mm_w8a8_shapes.py --input-dir CAPTURE --output /tmp/gmm.json
-then pass --shape_file /tmp/gmm.json. The converter preserves per-scenario counts
-and captured first-observation expert partitions. INT8 uses the direct
-ContinuousGroupedGEMM baseline. Prepared external INT8/FP8 diagnostic JSON files
-are also accepted; their classification must identify synthetic routing.
+Real-shape source (external MetaX server dataset):
+/data/fzy/real_shapes_20261019/grouped_gemm_nt_i8i8bf16_nopad
+The capture bundle contains shapes.json and metadata/*.jsonl. Prepared benchmark
+JSON stays outside the repository and is supplied with --shape_file PATH.
+It preserves per-scenario call counts, captured first-observation expert counts,
+cumulative offsets and tensor layouts. Operand values and scales are generated
+deterministically, not captured model values. INT8 uses ContinuousGroupedGEMM.
+Prepared external INT8/FP8 diagnostic JSON files are also accepted; their
+classification must identify synthetic routing.
 
 Both routes receive A, As, B, Bs, preallocated BF16 C, m_indices and m_rows.
 The mctlass adapter builds segment offsets and identity weight indices on the
@@ -61,10 +64,9 @@ class GroupedMMW8A8Benchmark(base.Benchmark):
         default = Path(__file__).with_name("core_shapes.yaml")
         if path.resolve() == default.resolve():
             pytest.skip(
-                "External grouped_mm_w8a8 dataset required: run "
-                "tools/prepare_grouped_mm_w8a8_shapes.py --input-dir CAPTURE "
-                "--output /tmp/grouped_mm_w8a8.json, then pass --shape_file "
-                "/tmp/grouped_mm_w8a8.json"
+                "External grouped_mm_w8a8 dataset required: pass --shape_file "
+                "PATH to a prepared benchmark JSON. See this module docstring "
+                "for the real-shape source."
             )
         self.dataset = json.loads(path.read_text())
         self.shapes = self.dataset["shapes"]
