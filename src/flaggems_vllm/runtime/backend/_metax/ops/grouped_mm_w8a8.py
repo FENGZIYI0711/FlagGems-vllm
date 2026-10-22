@@ -176,6 +176,9 @@ def _select_config(M, N, K, num_groups, mode, is_int8):
         # Packed M alone overestimates the useful tile height for small experts.
         if mode == 0 and M <= 16 * num_groups and N >= 64 and K >= 128:
             return (16, 64, 128, 4)
+        # Long-K projections reuse operands across a larger reduction tile.
+        if mode == 0 and M >= 4096 and 256 <= N <= 512 and K >= 2048:
+            return (128, 128, 128, 8)
         # Larger expert groups can amortize wider tiles and their shared memory.
         if mode == 0 and N == 256 and K >= 512 and M >= 256 * num_groups:
             return (256, 128, 64, 8)
@@ -533,27 +536,29 @@ def _grouped_mm_quantized(
             bm, bn, bk, warps = (64, 64, 64, 4)
         elif (bm, bn) == (128, 256):
             bm, bn, bk, warps = (128, 128, 64, 4)
+        elif (bm, bn, bk, warps) == (128, 128, 128, 8):
+            bm, bn, bk, warps = (128, 128, 64, 4)
     # Direct expert mapping avoids prefix work for small average group sizes;
     # its inner M loop also handles skewed partitions with larger individual groups.
     stages = 2 if is_int8 else 1
     if is_int8 and mode == 0 and _use_sparse_int8(M, N, K, groups):
         stages = 1
     compact_groups = active_groups is not None
-    direct_group = mode == 0 and M <= 64 * groups
+    long_k_tiles = is_int8 and mode == 0 and (bm, bn, bk, warps) == (128, 128, 128, 8)
+    direct_group = mode == 0 and M <= 64 * groups and not long_k_tiles
     if mode == 0:
         grid = (triton.cdiv(M, bm) + groups - 1, triton.cdiv(N, bn))
     elif mode == 1:
         grid = (triton.cdiv(N, bn) + groups - 1, triton.cdiv(M, bm))
     else:
         grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn), groups)
-    # A wider N makes group-local traversal worthwhile; narrower GEMMs retain
-    # the original tile order with the tuned four-warp tile configuration.
+    # Keep neighboring CTAs on one expert to reuse long-K operands in cache.
     group_major = (
         not direct_group
         and is_int8
         and mode == 0
         and M >= 4096
-        and N >= 1024
+        and (N >= 1024 or long_k_tiles)
         and K >= 512
     )
     if group_major:
