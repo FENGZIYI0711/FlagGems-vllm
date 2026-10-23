@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # isort: off
+from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
@@ -219,6 +220,7 @@ from flaggems_vllm.ops.vit_attention import (
 )
 
 __all__ = [
+    "gdn_w8a16",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
