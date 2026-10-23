@@ -155,21 +155,22 @@ def gdn_w8a16(
     # starting at zero and ending at T; reading them here would synchronize.
     # MetaX measurements select chunking for long, 128-dimensional heads.
     # Keep other backends, dimensions, and short sequences on the recurrence.
-    chunks_capacity = triton.cdiv(tokens, 64) + sequences
-    workspace_bytes = chunks_capacity * value_heads * 49216 * 4
     if (
         runtime.device.vendor_name == "metax"
         and key_dim == value_dim == 128
         and tokens >= 128 * sequences
         and sequences <= 64
-        and workspace_bytes <= 2 * 1024**3
     ):
-        from flaggems_vllm.runtime.backend._metax.gdn_w8a16_chunk import gdn_w8a16_chunk
-
-        return gdn_w8a16_chunk(
-            (q, k, v, g, beta, initial_state, cu_seqlens),
-            key_dim**-0.5 if scale is None else scale,
+        from flaggems_vllm.runtime.backend._metax.gdn_w8a16_chunk import (
+            _workspace_plan,
+            gdn_w8a16_chunk,
         )
+
+        if _workspace_plan(tokens, sequences, value_heads)[1]:
+            return gdn_w8a16_chunk(
+                (q, k, v, g, beta, initial_state, cu_seqlens),
+                key_dim**-0.5 if scale is None else scale,
+            )
     single = tokens == sequences
     value_block = 32 if single and sequences >= 3 else 16
     output = torch.empty(v.shape, device=v.device, dtype=v.dtype)

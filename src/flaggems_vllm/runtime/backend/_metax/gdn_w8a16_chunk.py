@@ -5,6 +5,8 @@
 The 16x16 blocked triangular inverse and V-major state layout follow the
 MetaX GDN design in FlagGems-vllm PR #771. Unlike that path, this variant
 keeps intermediate states/W/U in FP32 and constructs chunk mappings on GPU.
+A bounded streaming window reuses temporary storage. Requests are interleaved
+when they fit in one window, preserving state-update parallelism.
 FP32 dot operands use three-term TF32 decomposition (tf32x3), not TF32.
 """
 
@@ -32,16 +34,48 @@ def _gdn_chunk_dotfp(a, b, PREC: tl.constexpr):
 
 
 @tr.jit
-def _gdn_chunk_locate(Cu, idx, N: tl.constexpr, NN: tl.constexpr):
+def _round_locate(counts, ns, idx, N: tl.constexpr):
+    # Compact round-robin ordering: all live requests contribute one chunk
+    # per round. Prefix(round) = sum(min(request_chunks, round)). This keeps
+    # windows balanced without a CPU read or padding to the longest request.
+    low = tl.full((), 0, counts.dtype)
+    high = tl.max(counts, 0)
+    while low < high:
+        mid = (low + high + 1) // 2
+        prefix = tl.sum(tl.minimum(counts, mid), 0)
+        low = tl.where(prefix <= idx, mid, low)
+        high = tl.where(prefix <= idx, high, mid - 1)
+    within = idx - tl.sum(tl.minimum(counts, low), 0)
+    active = counts > low
+    ranks = tl.cumsum(active.to(tl.int32))
+    seq = tl.min(tl.where(active & (ranks > within), ns, N), 0)
+    return low, seq
+
+
+@tr.jit
+def _gdn_chunk_locate(
+    Cu, idx, N: tl.constexpr, NN: tl.constexpr, WIDE: tl.constexpr, CAP: tl.constexpr
+):
+    # Interleave requests when every request can occupy a slot; otherwise
+    # contiguous packing avoids repeatedly loading many request states.
+    if N > 1 and N <= CAP:
+        ns = tl.arange(0, NN)
+        starts = tl.load(Cu + ns, ns < N, 0).to(tl.int64 if WIDE else tl.int32)
+        ends = tl.load(Cu + ns + 1, ns < N, 0).to(tl.int64 if WIDE else tl.int32)
+        counts = tl.where(ns < N, tl.cdiv(ends - starts, 64), 0)
+        ch, seq = _round_locate(counts, ns, idx, N)
+        start = tl.load(Cu + seq).to(tl.int64 if WIDE else tl.int32)
+        end = tl.load(Cu + seq + 1, seq < N, 0).to(tl.int64 if WIDE else tl.int32)
+        return start + ch * 64, end, seq
     ns = tl.arange(0, NN)
-    a = tl.load(Cu + ns, ns < N, 0).to(tl.int64)
-    b = tl.load(Cu + ns + 1, ns < N, 0).to(tl.int64)
+    a = tl.load(Cu + ns, ns < N, 0).to(tl.int64 if WIDE else tl.int32)
+    b = tl.load(Cu + ns + 1, ns < N, 0).to(tl.int64 if WIDE else tl.int32)
     counts = tl.where(ns < N, tl.cdiv(b - a, 64), 0)
     ends = tl.cumsum(counts)
     seq = tl.sum(((ends <= idx) & (ns < N)).to(tl.int32), 0)
     off = tl.sum(tl.where(ns < seq, counts, 0), 0)
-    start = tl.load(Cu + seq).to(tl.int64)
-    end = tl.load(Cu + seq + 1, seq < N, 0).to(tl.int64)
+    start = tl.load(Cu + seq).to(tl.int64 if WIDE else tl.int32)
+    end = tl.load(Cu + seq + 1, seq < N, 0).to(tl.int64 if WIDE else tl.int32)
     return start + (idx - off) * 64, end, seq
 
 
@@ -66,6 +100,8 @@ def _gdn_chunk_store16(A, c, h, i: tl.constexpr, j: tl.constexpr, b, HV: tl.cons
 
 @tr.jit
 def _gdn_chunk_prep(
+    BASE,
+    CAP: tl.constexpr,
     Q,
     K,
     G,
@@ -84,10 +120,11 @@ def _gdn_chunk_prep(
     KS: tl.constexpr,
     BK: tl.constexpr,
     PREC: tl.constexpr,
+    WIDE: tl.constexpr,
 ):
     c = tl.program_id(0)
     h = tl.program_id(1)
-    start, end, seq = _gdn_chunk_locate(Cu, c, N, NN)
+    start, end, seq = _gdn_chunk_locate(Cu, c + BASE, N, NN, WIDE, CAP)
     if seq >= N:
         return
     t = tl.arange(0, 64)
@@ -188,6 +225,8 @@ def _gdn_chunk_prep(
 
 @tr.jit
 def _gdn_chunk_wy(
+    BASE,
+    CAP: tl.constexpr,
     K,
     V,
     B,
@@ -205,11 +244,12 @@ def _gdn_chunk_wy(
     KS: tl.constexpr,
     VS: tl.constexpr,
     PREC: tl.constexpr,
+    WIDE: tl.constexpr,
 ):
     c = tl.program_id(0)
     h = tl.program_id(1)
     tile = tl.program_id(2)
-    start, end, seq = _gdn_chunk_locate(Cu, c, N, NN)
+    start, end, seq = _gdn_chunk_locate(Cu, c + BASE, N, NN, WIDE, CAP)
     if seq >= N:
         return
     t = tl.arange(0, 64)
@@ -237,6 +277,8 @@ def _gdn_chunk_wy(
 
 @tr.jit
 def _gdn_chunk_scan(
+    BASE,
+    CAP: tl.constexpr,
     Q,
     K,
     Cu,
@@ -261,23 +303,42 @@ def _gdn_chunk_scan(
     BV: tl.constexpr,
     SCALE: tl.constexpr,
     PREC: tl.constexpr,
+    WIDE: tl.constexpr,
 ):
     seq = tl.program_id(0)
     h = tl.program_id(1)
     tile = tl.program_id(2)
     ns = tl.arange(0, NN)
-    starts = tl.load(Cu + ns, ns < N, 0).to(tl.int64)
-    ends = tl.load(Cu + ns + 1, ns < N, 0).to(tl.int64)
+    starts = tl.load(Cu + ns, ns < N, 0).to(tl.int64 if WIDE else tl.int32)
+    ends = tl.load(Cu + ns + 1, ns < N, 0).to(tl.int64 if WIDE else tl.int32)
     offset = tl.sum(tl.where(ns < seq, tl.cdiv(ends - starts, 64), 0), 0)
-    start = tl.load(Cu + seq).to(tl.int64)
-    end = tl.load(Cu + seq + 1).to(tl.int64)
+    start = tl.load(Cu + seq).to(tl.int64 if WIDE else tl.int32)
+    end = tl.load(Cu + seq + 1).to(tl.int64 if WIDE else tl.int32)
+    if N == 1 or N > CAP:
+        first = tl.maximum(0, BASE - offset)
+        stop = tl.minimum(tl.cdiv(end - start, 64), BASE + CAP - offset)
+    else:
+        counts = tl.where(ns < N, tl.cdiv(ends - starts, 64), 0)
+        first_round, first_seq = _round_locate(counts, ns, BASE, N)
+        stop_round, stop_seq = _round_locate(counts, ns, BASE + CAP, N)
+        first = tl.minimum(tl.cdiv(end - start, 64), first_round + (seq < first_seq))
+        stop = tl.minimum(tl.cdiv(end - start, 64), stop_round + (seq < stop_seq))
+    if BASE > 0 and first >= stop:
+        return
     kdim = tl.arange(0, BK)
     vdim = tile * BV + tl.arange(0, BV)
     t = tl.arange(0, 64)
     stateoff = ((seq * HV + h) * DV + vdim[:, None]) * DK + kdim[None, :]
     state = tl.load(S + stateoff, (vdim[:, None] < DV) & (kdim[None, :] < DK), 0)
-    for ch in range(tl.cdiv(end - start, 64)):
-        c = offset + ch
+    for ch in range(first, stop):
+        if N == 1 or N > CAP:
+            c = offset + ch - BASE
+        else:
+            c = (
+                tl.sum(tl.minimum(counts, ch), 0)
+                + tl.sum(((ns < seq) & (counts > ch)).to(tl.int32), 0)
+                - BASE
+            )
         token = start + ch * 64 + t
         gc = tl.load(GC + (c * HV + h) * 64 + t)
         last = tl.sum(tl.where(t == 63, gc, 0.0), 0)
@@ -316,6 +377,8 @@ def _gdn_chunk_scan(
 
 @tr.jit
 def _gdn_chunk_output(
+    BASE,
+    CAP: tl.constexpr,
     Q,
     Cu,
     GC,
@@ -334,11 +397,12 @@ def _gdn_chunk_output(
     BV: tl.constexpr,
     SCALE: tl.constexpr,
     PREC: tl.constexpr,
+    WIDE: tl.constexpr,
 ):
     c = tl.program_id(0)
     h = tl.program_id(1)
     tile = tl.program_id(2)
-    start, end, seq = _gdn_chunk_locate(Cu, c, N, NN)
+    start, end, seq = _gdn_chunk_locate(Cu, c + BASE, N, NN, WIDE, CAP)
     if seq >= N:
         return
     t = tl.arange(0, 64)
@@ -371,6 +435,23 @@ def _gdn_chunk_output(
     )
 
 
+# Temporary FP32 tensors only; output/final state are separate API results.
+_WORKSPACE_LIMIT_BYTES = 256 * 1024**2
+_MAX_CHUNKS_PER_WINDOW = 32
+
+
+def _workspace_plan(tokens, sequences, value_heads):
+    # Sum ceil(length / 64) <= floor((T + 63*N) / 64), including empty requests.
+    total = (tokens + 63 * sequences) // 64
+    # A + QK + GC + W + U + HS; UP aliases U after its last read.
+    bytes_per_chunk = value_heads * (2 * 64**2 + 64 + 2 * 64 * 128 + 128**2) * 4
+    max_slots = _WORKSPACE_LIMIT_BYTES // bytes_per_chunk
+    if not max_slots:
+        return total, 0, 0
+    capacity = min(total, _MAX_CHUNKS_PER_WINDOW, 1 << (max_slots.bit_length() - 1))
+    return total, capacity, capacity * bytes_per_chunk
+
+
 def gdn_w8a16_chunk(args, scale):
     # Fixed MetaX configuration selected outside graph capture.
     bv, warps, prec = 64, 4, "tf32x3"
@@ -378,7 +459,13 @@ def gdn_w8a16_chunk(args, scale):
     t, h, dk = q.shape[1:]
     hv, dv = v.shape[2:]
     n = cu.numel() - 1
-    c = tr.cdiv(t, 64) + n
+    total, c, _ = _workspace_plan(t, n, hv)
+    if not c:
+        raise NotImplementedError("GDN chunk workspace cannot fit one chunk")
+    wide = (
+        max(t * q.stride(1), t * k.stride(1), t * v.stride(1), s.numel(), t * hv)
+        >= 2**31
+    )
     nn = tr.next_power_of_2(n)
     alloc = lambda shape: torch.empty(shape, device=q.device, dtype=torch.float32)
     a = alloc((c, hv, 64, 64))
@@ -387,98 +474,116 @@ def gdn_w8a16_chunk(args, scale):
     w = alloc((c, hv, 64, dk))
     u = alloc((c, hv, 64, dv))
     hs = alloc((c, hv, dv, dk))
-    up = alloc((c, hv, 64, dv))
+    # Each scan CTA owns disjoint V columns and loads U before replacing it.
+    # The output kernel consumes these updates before the next window's WY.
+    up = u
     o = torch.empty(v.shape, device=v.device, dtype=v.dtype)
     f = torch.empty_like(s)
-    _gdn_chunk_prep[(c, hv)](
-        q,
-        k,
-        g,
-        b,
-        cu,
-        a,
-        gc,
-        qk,
-        t,
-        h,
-        hv,
-        dk,
-        n,
-        nn,
-        q.stride(1),
-        k.stride(1),
-        tr.next_power_of_2(dk),
-        prec,
-        num_warps=4,
-    )
-    _gdn_chunk_wy[(c, hv, tr.cdiv(max(dk, dv), 32))](
-        k,
-        v,
-        b,
-        cu,
-        a,
-        gc,
-        w,
-        u,
-        h,
-        hv,
-        dk,
-        dv,
-        n,
-        nn,
-        k.stride(1),
-        v.stride(1),
-        prec,
-        num_warps=4,
-    )
-    _gdn_chunk_scan[(n, hv, tr.cdiv(dv, bv))](
-        q,
-        k,
-        cu,
-        gc,
-        qk,
-        w,
-        u,
-        s,
-        o,
-        f,
-        hs,
-        up,
-        h,
-        hv,
-        dk,
-        dv,
-        n,
-        nn,
-        q.stride(1),
-        k.stride(1),
-        tr.next_power_of_2(dk),
-        bv,
-        scale,
-        prec,
-        num_warps=warps,
-        num_stages=1,
-        pipeline="cpasync-mixed",
-    )
-    _gdn_chunk_output[(c, hv, tr.cdiv(dv, bv))](
-        q,
-        cu,
-        gc,
-        qk,
-        hs,
-        up,
-        o,
-        h,
-        hv,
-        dk,
-        dv,
-        n,
-        nn,
-        q.stride(1),
-        tr.next_power_of_2(dk),
-        bv,
-        scale,
-        prec,
-        num_warps=4,
-    )
+    # Reuse the same workspace across graph launches. After the first window,
+    # F carries state; S is never modified. All mappings are derived from Cu
+    # on device, so replay remains valid when Cu contents change.
+    for base in range(0, total, c):
+        _gdn_chunk_prep[(c, hv)](
+            base,
+            c,
+            q,
+            k,
+            g,
+            b,
+            cu,
+            a,
+            gc,
+            qk,
+            t,
+            h,
+            hv,
+            dk,
+            n,
+            nn,
+            q.stride(1),
+            k.stride(1),
+            tr.next_power_of_2(dk),
+            prec,
+            wide,
+            num_warps=4,
+        )
+        _gdn_chunk_wy[(c, hv, tr.cdiv(max(dk, dv), 32))](
+            base,
+            c,
+            k,
+            v,
+            b,
+            cu,
+            a,
+            gc,
+            w,
+            u,
+            h,
+            hv,
+            dk,
+            dv,
+            n,
+            nn,
+            k.stride(1),
+            v.stride(1),
+            prec,
+            wide,
+            num_warps=4,
+        )
+        _gdn_chunk_scan[(n, hv, tr.cdiv(dv, bv))](
+            base,
+            c,
+            q,
+            k,
+            cu,
+            gc,
+            qk,
+            w,
+            u,
+            s if base == 0 else f,
+            o,
+            f,
+            hs,
+            up,
+            h,
+            hv,
+            dk,
+            dv,
+            n,
+            nn,
+            q.stride(1),
+            k.stride(1),
+            tr.next_power_of_2(dk),
+            bv,
+            scale,
+            prec,
+            wide,
+            num_warps=warps,
+            num_stages=1,
+            pipeline="cpasync-mixed",
+        )
+        _gdn_chunk_output[(c, hv, tr.cdiv(dv, bv))](
+            base,
+            c,
+            q,
+            cu,
+            gc,
+            qk,
+            hs,
+            up,
+            o,
+            h,
+            hv,
+            dk,
+            dv,
+            n,
+            nn,
+            q.stride(1),
+            tr.next_power_of_2(dk),
+            bv,
+            scale,
+            prec,
+            wide,
+            num_warps=4,
+        )
     return o, f

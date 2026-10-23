@@ -10,7 +10,9 @@ Freeze the original implementation before comparing:
 GDN_COMPARE_GROUP selects all (default), decode, or prefill. The native
 MetaX adapters disable QK normalization and do not modify the input state.
 Recurrent returns per-token states: selection of final states is timed.
-Chunk metadata is prepared before capture, as required by the native API.
+Set GDN_MEASURE_MEMORY=1 to record peak incremental live allocations after
+warmup, including returned tensors (reported separately). Reserved allocator
+cache is excluded. Chunk metadata is prepared before capture for the native API.
 The optimized implementation constructs its chunk mapping on device.
 """
 
@@ -74,6 +76,20 @@ def prepare_native(args, bounds, prefill):
     return call
 
 
+def measure_peak_allocation(function):
+    """Incremental live allocation after warmup; excludes cached/reserved bytes."""
+    warm = function()
+    torch.cuda.synchronize()
+    del warm
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    result = function()
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - allocated
+    result_bytes = sum(x.numel() * x.element_size() for x in result)
+    return dict(peak_bytes=peak, result_bytes=result_bytes)
+
+
 def compare_case(row, current, bench):
     from functools import partial
 
@@ -119,7 +135,14 @@ def compare_case(row, current, bench):
             end.record()
             end.synchronize()
             samples[name].append(begin.elapsed_time(end) * 1000 / 3)
+    memory = {}
+    if os.environ.get("GDN_MEASURE_MEMORY", "0") == "1":
+        memory = {
+            name: measure_peak_allocation(functions[name])
+            for name in ("current", "optimized", "metax")
+        }
     return dict(
+        memory=memory,
         op=row["op"],
         shape=row["shape"],
         count=row["count"],

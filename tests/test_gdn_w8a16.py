@@ -179,3 +179,47 @@ def test_gdn_w8a16_chunk_packed_custom_scale():
         actual[0].float(), expected[0] * (0.25 / 128**-0.5), atol=0.002, rtol=0.02
     )
     torch.testing.assert_close(actual[1], expected[1], atol=1e-4, rtol=0.002)
+
+
+@pytest.mark.parametrize("sequences", [3, 5])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.gdn_w8a16
+def test_gdn_w8a16_bounded_workspace_replay(monkeypatch, dtype, sequences):
+    from flaggems_vllm import runtime
+
+    if runtime.device.vendor_name != "metax":
+        pytest.skip("MetaX windowed chunk implementation")
+    import flaggems_vllm.runtime.backend._metax.gdn_w8a16_chunk as chunk
+
+    # A small budget forces several windows without a large CI allocation.
+    budget = 4 * 1024**2
+    monkeypatch.setattr(chunk, "_WORKSPACE_LIMIT_BYTES", budget)
+    args, _ = inputs(dict(shape=[1, 641, 2, 128, 4, 128, sequences]), dtype)
+    original = args[5].clone()
+    for _ in range(3):
+        gdn_w8a16(*args)
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    actual = gdn_w8a16(*args)
+    torch.cuda.synchronize()
+    result_bytes = sum(x.numel() * x.element_size() for x in actual)
+    assert torch.cuda.max_memory_allocated() - allocated <= budget + result_bytes + 4096
+    del actual
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = gdn_w8a16(*args)
+    # Move empty and long requests across windows at the same Cu address.
+    for bounds in (
+        [0] * (sequences - 1) + [1, 641],
+        [0, 321] + [321] * (sequences - 2) + [641],
+    ):
+        args[-1].copy_(torch.tensor(bounds, device="cuda", dtype=torch.int32))
+        expected = reference(*args[:6], bounds)
+        for _ in range(2):
+            graph.replay()
+            torch.testing.assert_close(
+                actual[0].float(), expected[0], atol=0.002, rtol=0.02
+            )
+            torch.testing.assert_close(actual[1], expected[1], atol=1e-4, rtol=0.002)
+            torch.testing.assert_close(args[5], original, atol=0, rtol=0)
