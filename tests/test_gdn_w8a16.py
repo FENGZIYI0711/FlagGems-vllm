@@ -99,6 +99,7 @@ def check(row, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("tokens,sequences", [(0, 1), (1, 1), (17, 3), (129, 2)])
+@pytest.mark.gdn_w8a16
 def test_gdn_w8a16(dtype, tokens, sequences):
     torch.manual_seed(1234)
     check(
@@ -109,11 +110,13 @@ def test_gdn_w8a16(dtype, tokens, sequences):
     )
 
 
+@pytest.mark.gdn_w8a16
 def test_gdn_w8a16_packed():
     torch.manual_seed(1234)
     check(dict(op="packed", shape=[7, 8192, 32, 128]), torch.bfloat16)
 
 
+@pytest.mark.gdn_w8a16
 def test_gdn_w8a16_reject_dtype():
     args, _ = inputs(dict(op="packed", shape=[1, 8192, 32, 128]))
     with pytest.raises(NotImplementedError):
@@ -122,11 +125,13 @@ def test_gdn_w8a16_reject_dtype():
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("tokens,sequences", [(512, 1), (1025, 3)])
+@pytest.mark.gdn_w8a16
 def test_gdn_w8a16_chunk(dtype, tokens, sequences):
     torch.manual_seed(1234)
     check(dict(shape=[1, tokens, 16, 128, 32, 128, sequences]), dtype)
 
 
+@pytest.mark.gdn_w8a16
 def test_gdn_w8a16_chunk_graph_boundaries():
     torch.manual_seed(1234)
     args, bounds = inputs(dict(shape=[1, 513, 16, 128, 32, 128, 3]))
@@ -147,6 +152,7 @@ def test_gdn_w8a16_chunk_graph_boundaries():
     torch.testing.assert_close(args[5], before, atol=0, rtol=0)
 
 
+@pytest.mark.gdn_w8a16
 def test_gdn_w8a16_single_dispatch_nonuniform():
     # T == N does not imply one token per sequence.
     args, _ = inputs(dict(shape=[1, 4, 16, 128, 32, 128, 4]))
@@ -158,6 +164,7 @@ def test_gdn_w8a16_single_dispatch_nonuniform():
     torch.testing.assert_close(actual[1], expected[1], atol=1e-4, rtol=0.002)
 
 
+@pytest.mark.gdn_w8a16
 def test_gdn_w8a16_chunk_packed_custom_scale():
     torch.manual_seed(1234)
     args, bounds = inputs(dict(shape=[1, 513, 16, 128, 32, 128, 3]))

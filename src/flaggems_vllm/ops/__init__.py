@@ -220,7 +220,6 @@ from flaggems_vllm.ops.vit_attention import (
 )
 
 __all__ = [
-    "gdn_w8a16",
     "act_quant_triton",
     "add_rms_norm",
     "apply_repetition_penalties",
@@ -278,6 +277,7 @@ __all__ = [
     "fwht128_quant_fp8",
     "gather_rows",
     "gather_state_rows",
+    "gdn_w8a16",
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",

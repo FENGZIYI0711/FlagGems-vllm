@@ -164,9 +164,7 @@ def gdn_w8a16(
         and sequences <= 64
         and workspace_bytes <= 2 * 1024**3
     ):
-        from flaggems_vllm.runtime.backend._metax.ops.gdn_w8a16_chunk import (
-            gdn_w8a16_chunk,
-        )
+        from flaggems_vllm.runtime.backend._metax.gdn_w8a16_chunk import gdn_w8a16_chunk
 
         return gdn_w8a16_chunk(
             (q, k, v, g, beta, initial_state, cu_seqlens),
