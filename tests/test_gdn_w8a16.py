@@ -118,3 +118,57 @@ def test_gdn_w8a16_reject_dtype():
     args, _ = inputs(dict(op="packed", shape=[1, 8192, 32, 128]))
     with pytest.raises(NotImplementedError):
         gdn_w8a16(args[0].float(), *args[1:])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("tokens,sequences", [(512, 1), (1025, 3)])
+def test_gdn_w8a16_chunk(dtype, tokens, sequences):
+    torch.manual_seed(1234)
+    check(dict(shape=[1, tokens, 16, 128, 32, 128, sequences]), dtype)
+
+
+def test_gdn_w8a16_chunk_graph_boundaries():
+    torch.manual_seed(1234)
+    args, bounds = inputs(dict(shape=[1, 513, 16, 128, 32, 128, 3]))
+    before = args[5].clone()
+    for _ in range(3):
+        gdn_w8a16(*args)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = gdn_w8a16(*args)
+    # Update contents at the same address: no identity-cached chunk metadata.
+    bounds = [0, 0, 1, 513]
+    args[-1].copy_(torch.tensor(bounds, device=args[0].device, dtype=torch.int32))
+    graph.replay()
+    expected = reference(*args[:6], bounds)
+    torch.testing.assert_close(actual[0].float(), expected[0], atol=0.002, rtol=0.02)
+    torch.testing.assert_close(actual[1], expected[1], atol=1e-4, rtol=0.002)
+    torch.testing.assert_close(args[5], before, atol=0, rtol=0)
+
+
+def test_gdn_w8a16_single_dispatch_nonuniform():
+    # T == N does not imply one token per sequence.
+    args, _ = inputs(dict(shape=[1, 4, 16, 128, 32, 128, 4]))
+    bounds = [0, 0, 1, 1, 4]
+    args[-1].copy_(torch.tensor(bounds, device=args[0].device, dtype=torch.int32))
+    actual = gdn_w8a16(*args)
+    expected = reference(*args[:6], bounds)
+    torch.testing.assert_close(actual[0].float(), expected[0], atol=0.002, rtol=0.02)
+    torch.testing.assert_close(actual[1], expected[1], atol=1e-4, rtol=0.002)
+
+
+def test_gdn_w8a16_chunk_packed_custom_scale():
+    torch.manual_seed(1234)
+    args, bounds = inputs(dict(shape=[1, 513, 16, 128, 32, 128, 3]))
+    q, k, v, g, beta, state, cu = args
+    mixed = torch.cat((q.flatten(2), k.flatten(2), v.flatten(2)), dim=-1)
+    q = mixed[..., :2048].view_as(q)
+    k = mixed[..., 2048:4096].view_as(k)
+    v = mixed[..., 4096:].view_as(v)
+    actual = gdn_w8a16(q, k, v, g, beta, state, cu, scale=0.25)
+    expected = reference(*args[:6], bounds)
+    torch.testing.assert_close(
+        actual[0].float(), expected[0] * (0.25 / 128**-0.5), atol=0.002, rtol=0.02
+    )
+    torch.testing.assert_close(actual[1], expected[1], atol=1e-4, rtol=0.002)
